@@ -240,7 +240,10 @@ fn parse_box_time(body: &[u8]) -> Option<chrono::NaiveDateTime> {
     if creation == 0 {
         return None;
     }
-    chrono::DateTime::from_timestamp(creation as i64 - QT_TO_UNIX, 0).map(|dt| dt.naive_local())
+    // from_timestamp gives DateTime<Utc>; naive_local() on that would just
+    // return the UTC wall time, so convert to Local first.
+    chrono::DateTime::from_timestamp(creation as i64 - QT_TO_UNIX, 0)
+        .map(|dt| dt.with_timezone(&chrono::Local).naive_local())
 }
 
 /// Embedded creation time from an MP4/MOV/M4V/3GP: moov/mvhd first,
