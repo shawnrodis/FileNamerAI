@@ -630,6 +630,7 @@ struct NamerApp {
     update_info: Option<(String, String)>,
     update_dismissed: bool,
     update_status: String,
+    update_pending: bool,
 }
 
 fn rename_worker(path: PathBuf, cfg: Config, tx: mpsc::Sender<WorkerMsg>) {
@@ -705,12 +706,14 @@ impl NamerApp {
             update_info: None,
             update_dismissed: false,
             update_status: String::new(),
+            update_pending: false,
         };
 
         if !app.is_rename_mode {
             // Check for updates in the background (silent unless one is found).
             let (utx, urx) = mpsc::channel();
             app.update_rx = Some(urx);
+            app.update_pending = true;
             thread::spawn(move || check_updates(utx));
         }
 
@@ -800,7 +803,10 @@ impl NamerApp {
         save_config(&self.cfg);
     }
 
-    fn poll_updates(&mut self) {
+    fn poll_updates(&mut self, ctx: &egui::Context) {
+        if self.update_pending {
+            ctx.request_repaint();
+        }
         let mut got: Option<UpdateMsg> = None;
         if let Some(rx) = &self.update_rx {
             while let Ok(m) = rx.try_recv() {
@@ -812,12 +818,15 @@ impl NamerApp {
                 self.update_info = Some((tag, url));
                 self.update_dismissed = false;
                 self.update_status.clear();
+                self.update_pending = false;
             }
             Some(UpdateMsg::UpToDate) => {
                 self.update_info = None;
                 self.update_status = format!("You're up to date (v{APP_VERSION}).");
+                self.update_pending = false;
             }
             Some(UpdateMsg::CheckFailed) => {
+                self.update_pending = false;
                 // Only report manual checks; the launch check stays silent.
                 if self.update_status == "Checking…" {
                     self.update_status =
@@ -828,8 +837,8 @@ impl NamerApp {
         }
     }
 
-    fn ui_settings(&mut self, ui: &mut egui::Ui) {
-        self.poll_updates();
+    fn ui_settings(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        self.poll_updates(ctx);
         ui.heading("File Namer AI");
         ui.label("Right-click any file → \"Rename with File Namer AI\" and a local AI proposes a better name.");
 
@@ -925,6 +934,7 @@ impl NamerApp {
                 self.update_dismissed = false;
                 self.update_info = None;
                 self.update_status = "Checking…".into();
+                self.update_pending = true;
                 thread::spawn(move || check_updates(tx2));
             }
             if !self.update_status.is_empty() {
@@ -1022,7 +1032,7 @@ impl eframe::App for NamerApp {
                 if self.is_rename_mode {
                     self.ui_rename(ui, ctx);
                 } else {
-                    self.ui_settings(ui);
+                    self.ui_settings(ctx, ui);
                 }
                 ui.add_space(8.0);
             });
