@@ -4,6 +4,7 @@
 
 use eframe::egui;
 use chrono::Datelike;
+use chrono::Timelike;
 use std::io::BufReader;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -248,7 +249,16 @@ fn parse_box_time(body: &[u8]) -> Option<chrono::NaiveDateTime> {
 
 /// Embedded creation time from an MP4/MOV/M4V/3GP: moov/mvhd first,
 /// then moov/trak/mdia/mdhd as fallback.
+///
+/// Matches Bulk Rename Utility: video timestamps are minute-precision,
+/// so seconds are truncated to :00.
 fn mp4_creation_datetime(path: &Path) -> Option<chrono::NaiveDateTime> {
+    let dt = mp4_creation_datetime_raw(path)?;
+    dt.with_second(0)?.with_nanosecond(0)
+}
+
+/// Raw embedded creation time (full precision).
+fn mp4_creation_datetime_raw(path: &Path) -> Option<chrono::NaiveDateTime> {
     let data = std::fs::read(path).ok()?;
     let moov = find_box_content(&data, b"moov")?;
     if let Some(mvhd) = find_box_content(moov, b"mvhd") {
