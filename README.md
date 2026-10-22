@@ -51,6 +51,19 @@ since file operations happen at or after capture.
 
 Note: on Windows 11 the menu item lives under "Show more options".
 
+## Based on Bulk Rename Utility
+
+The photo/video naming logic is designed to match
+[Bulk Rename Utility](https://www.bulkrenameutility.co.uk/) using these two
+saved profiles (included in [`bru-profiles/`](bru-profiles/)):
+
+- **File Name By Date Taken (Pictures)** — photos with real EXIF Date Taken
+  keep full seconds.
+- **File Name By Item Date (Videos & Screenshots)** — videos and photos
+  without real EXIF data are truncated to the minute (`:00` seconds).
+
+If you use BRU, these profiles produce identical names to File Namer AI.
+
 ## Build from source
 
 On Windows (install Rust via [rustup](https://rustup.rs/) first):
