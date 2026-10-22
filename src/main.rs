@@ -22,6 +22,7 @@ const MENU_KEY: &str = r"HKCU\Software\Classes\*\shell\FileNamerAI";
 // config
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct Config {
     ollama_url: String,
     model: String,
@@ -268,10 +269,15 @@ fn ollama_up(url: &str) -> bool {
     }
 }
 
-fn build_prompt(original: &str, content: &str, append_date: bool) -> String {
+fn build_prompt(original: &str, content: &str, append_date: bool, attempt: u32) -> String {
     let date_rule = if append_date {
         "- If the content contains an obvious document date (invoice date, letter date, statement date), append it after an underscore as _DD-Mon-YYYY with the month capitalized, e.g. Saw Palmetto Price Comparison_28-May-2023.\n\
          - Never invent, guess, or approximate a date. If no date appears in the content, output the name with no date at all.\n"
+    } else {
+        ""
+    };
+    let retry_rule = if attempt > 0 {
+        "- IMPORTANT: you already proposed a name for this file and it was rejected. Propose a DIFFERENT name this time — different wording, not a tweak.\n"
     } else {
         ""
     };
@@ -283,6 +289,7 @@ fn build_prompt(original: &str, content: &str, append_date: bool) -> String {
          - Use spaces between words with normal Title Case (e.g. Saw Palmetto Price Comparison). Never ALL CAPS.\n\
          - Maximum 50 characters.\n\
          {date_rule}\
+         {retry_rule}\
          \n\
          Original filename: {original}\n\
          Content:\n\
@@ -321,7 +328,7 @@ fn sanitize_filename(raw: &str) -> String {
     s.chars().take(80).collect()
 }
 
-fn ask_ollama(cfg: &Config, path: &Path, content: &str) -> Result<String, String> {
+fn ask_ollama(cfg: &Config, path: &Path, content: &str, attempt: u32) -> Result<String, String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(180))
         .build()
@@ -331,14 +338,15 @@ fn ask_ollama(cfg: &Config, path: &Path, content: &str) -> Result<String, String
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("file");
+    let temp = if attempt == 0 { 0.2 } else { 0.7 };
     let body = serde_json::json!({
         "model": cfg.model,
         "messages": [
             {"role": "system", "content": "You are a file renaming assistant. You output only the proposed filename, nothing else."},
-            {"role": "user", "content": build_prompt(original, content, cfg.append_date && !cfg.never_dates)}
+            {"role": "user", "content": build_prompt(original, content, cfg.append_date && !cfg.never_dates, attempt)}
         ],
         "stream": false,
-        "options": {"temperature": 0.2}
+        "options": {"temperature": temp}
     });
 
     let resp = client
@@ -718,6 +726,7 @@ struct NamerApp {
     state: RenameState,
     suggestion: String,
     date_source: Option<String>,
+    attempt: u32,
     show_about: bool,
     // update check
     update_rx: Option<mpsc::Receiver<UpdateMsg>>,
@@ -727,7 +736,7 @@ struct NamerApp {
     update_pending: bool,
 }
 
-fn rename_worker(path: PathBuf, cfg: Config, tx: mpsc::Sender<WorkerMsg>) {
+fn rename_worker(path: PathBuf, cfg: Config, tx: mpsc::Sender<WorkerMsg>, attempt: u32) {
     let send = |m| {
         let _ = tx.send(m);
     };
@@ -751,7 +760,7 @@ fn rename_worker(path: PathBuf, cfg: Config, tx: mpsc::Sender<WorkerMsg>) {
                 send(WorkerMsg::NeedOllama);
                 return;
             }
-            match ask_ollama(&cfg, &path, &content) {
+            match ask_ollama(&cfg, &path, &content, attempt) {
                 Ok(name) => send(WorkerMsg::Suggestion(name)),
                 Err(e) => send(WorkerMsg::Failed(e)),
             }
@@ -795,6 +804,7 @@ impl NamerApp {
             state: RenameState::Working,
             suggestion: String::new(),
             date_source: None,
+            attempt: 0,
             show_about: false,
             update_rx: None,
             update_info: None,
@@ -812,16 +822,7 @@ impl NamerApp {
         }
 
         if app.is_rename_mode {
-            let (tx, rx) = mpsc::channel();
-            app.rx = Some(rx);
-            let path = app.file_path.clone().unwrap();
-            let cfg = Config {
-                ollama_url: app.cfg.ollama_url.clone(),
-                model: app.cfg.model.clone(),
-                append_date: app.cfg.append_date,
-                never_dates: app.cfg.never_dates,
-            };
-            thread::spawn(move || rename_worker(path, cfg, tx));
+            app.start_worker();
         }
         app
     }
@@ -861,6 +862,20 @@ impl NamerApp {
                 }
             }
         }
+    }
+
+    /// (Re)start the background suggestion worker.
+    fn start_worker(&mut self) {
+        let path = match self.file_path.clone() {
+            Some(p) => p,
+            None => return,
+        };
+        let (tx, rx) = mpsc::channel();
+        self.rx = Some(rx);
+        self.state = RenameState::Working;
+        let cfg = self.cfg.clone();
+        let attempt = self.attempt;
+        thread::spawn(move || rename_worker(path, cfg, tx, attempt));
     }
 
     fn do_rename(&mut self) {
@@ -1093,6 +1108,10 @@ impl NamerApp {
                 ui.horizontal(|ui| {
                     if ui.button("Rename").clicked() {
                         self.do_rename();
+                    }
+                    if ui.button("New name").clicked() {
+                        self.attempt += 1;
+                        self.start_worker();
                     }
                     if ui.button("Cancel").clicked() {
                         std::process::exit(0);
