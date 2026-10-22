@@ -269,7 +269,7 @@ fn ollama_up(url: &str) -> bool {
 
 fn build_prompt(original: &str, content: &str, append_date: bool) -> String {
     let date_rule = if append_date {
-        "- If the content contains an obvious document date (invoice date, letter date, statement date), append it as _DD-Mon-YYYY, e.g. Report_Q3_19-Oct-2026.\n\
+        "- If the content contains an obvious document date (invoice date, letter date, statement date), append it after an underscore as _DD-Mon-YYYY with the month capitalized, e.g. Saw Palmetto Price Comparison_28-May-2023.\n\
          - Never invent, guess, or approximate a date. If no date appears in the content, output the name with no date at all.\n"
     } else {
         ""
@@ -279,7 +279,7 @@ fn build_prompt(original: &str, content: &str, append_date: bool) -> String {
          \n\
          Rules (follow exactly):\n\
          - Output ONLY the filename: no quotes, no explanation, no file extension.\n\
-         - Use underscores between words. No spaces.\n\
+         - Use spaces between words, e.g. Saw Palmetto Price Comparison.\n\
          - Maximum 50 characters.\n\
          {date_rule}\
          \n\
@@ -301,18 +301,18 @@ fn sanitize_filename(raw: &str) -> String {
         .filter(|c| !matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'))
         .filter(|c| !c.is_control())
         .collect();
-    // collapse whitespace runs into a single underscore
+    // collapse whitespace runs into a single space
     let mut out = String::with_capacity(s.len());
-    let mut prev_us = false;
+    let mut prev_sp = false;
     for c in s.chars() {
         if c.is_whitespace() {
-            if !prev_us && !out.is_empty() {
-                out.push('_');
-                prev_us = true;
+            if !prev_sp && !out.is_empty() {
+                out.push(' ');
+                prev_sp = true;
             }
         } else {
             out.push(c);
-            prev_us = false;
+            prev_sp = false;
         }
     }
     s = out;
@@ -358,10 +358,17 @@ fn ask_ollama(cfg: &Config, path: &Path, content: &str) -> Result<String, String
     }
     // Verify any date the model added: it must actually appear in the content.
     // If not — or if the user disabled dates entirely — strip it.
+    // Otherwise normalize it to Shawn's format (28-Mar-2012).
     // Never ship an invented date.
     let name = match split_date_suffix(&name) {
         Some((stem, _, _, _)) if cfg.never_dates => stem.to_string(),
-        Some((stem, d, m, y)) if !date_in_content(content, d, m, y) => stem.to_string(),
+        Some((stem, d, m, y)) => {
+            if date_in_content(content, d, m, y) {
+                format!("{stem}_{}", fmt_doc_date(d, m, y))
+            } else {
+                stem.to_string()
+            }
+        }
         _ => name,
     };
     Ok(name)
@@ -414,6 +421,7 @@ const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 enum UpdateMsg {
     Available(String, String), // (version tag, release url)
     UpToDate,
+    CheckFailed,
 }
 
 fn parse_ver(s: &str) -> (u64, u64, u64) {
@@ -439,7 +447,10 @@ fn check_updates(tx: mpsc::Sender<UpdateMsg>) {
         .build()
     {
         Ok(c) => c,
-        Err(_) => return, // stay silent offline
+        Err(_) => {
+            send(UpdateMsg::CheckFailed);
+            return;
+        }
     };
     let v: serde_json::Value = match client
         .get(format!(
@@ -449,13 +460,20 @@ fn check_updates(tx: mpsc::Sender<UpdateMsg>) {
     {
         Ok(r) if r.status().is_success() => match r.json() {
             Ok(v) => v,
-            Err(_) => return,
+            Err(_) => {
+                send(UpdateMsg::CheckFailed);
+                return;
+            }
         },
-        _ => return,
+        _ => {
+            send(UpdateMsg::CheckFailed);
+            return;
+        }
     };
     let tag = v["tag_name"].as_str().unwrap_or("").to_string();
     let url = v["html_url"].as_str().unwrap_or("").to_string();
     if tag.is_empty() || url.is_empty() {
+        send(UpdateMsg::CheckFailed);
         return;
     }
     if parse_ver(&tag) > parse_ver(APP_VERSION) {
@@ -480,25 +498,49 @@ const MONTHS_ABBR: [&str; 12] = [
     "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
 ];
 
-/// Parse a trailing "_DD-Mon-YYYY" suffix. Returns (stem, day, month, year).
+fn valid_ymd(day: u32, mon: u32, year: i32) -> bool {
+    (1..=31).contains(&day) && (1..=12).contains(&mon) && (1900..=2100).contains(&year)
+}
+
+/// Parse a trailing date suffix in common formats. Returns (stem, day, month, year).
+/// Handles _DD-Mon-YYYY (e.g. _13-Oct-2025), _YYYY-MM-DD (e.g. _2025-10-13),
+/// and _MM-DD-YYYY (e.g. _10-13-2025).
 fn split_date_suffix(s: &str) -> Option<(&str, u32, u32, i32)> {
     let i = s.rfind('_')?;
     let (stem, tail) = (&s[..i], &s[i + 1..]);
-    let mut parts = tail.split('-');
-    let day: u32 = parts.next()?.parse().ok()?;
-    let mon_s = parts.next()?;
-    let year: i32 = parts.next()?.parse().ok()?;
-    if parts.next().is_some() {
-        return None;
+    let parts: Vec<&str> = tail.split('-').collect();
+    match parts.as_slice() {
+        [d, m, y] if m.chars().any(|c| c.is_alphabetic()) => {
+            let day: u32 = d.parse().ok()?;
+            let year: i32 = y.parse().ok()?;
+            let mon = MONTHS_ABBR.iter().position(|x| x.eq_ignore_ascii_case(m))? as u32 + 1;
+            valid_ymd(day, mon, year).then_some((stem, day, mon, year))
+        }
+        [y, m, d] if y.len() == 4 => {
+            let (year, mon, day): (i32, u32, u32) =
+                (y.parse().ok()?, m.parse().ok()?, d.parse().ok()?);
+            valid_ymd(day, mon, year).then_some((stem, day, mon, year))
+        }
+        [a, b, c] if c.len() == 4 => {
+            // All-numeric _MM-DD-YYYY (US order); if first > 12 it must be DD-MM-YYYY.
+            let (n1, n2, year): (u32, u32, i32) = (a.parse().ok()?, b.parse().ok()?, c.parse().ok()?);
+            let (day, mon) = if n1 > 12 { (n1, n2) } else { (n2, n1) };
+            valid_ymd(day, mon, year).then_some((stem, day, mon, year))
+        }
+        _ => None,
     }
-    if !(1..=31).contains(&day) || !(1900..=2100).contains(&year) {
-        return None;
-    }
-    let mon = MONTHS_ABBR
-        .iter()
-        .position(|m| m.eq_ignore_ascii_case(mon_s))? as u32
-        + 1;
-    Some((stem, day, mon, year))
+}
+
+/// Format a date the way Shawn wants it: 28-Mar-2012.
+fn fmt_doc_date(day: u32, mon: u32, year: i32) -> String {
+    let abbr = MONTHS_ABBR[(mon - 1) as usize];
+    let mut chars = abbr.chars();
+    let cap: String = chars
+        .next()
+        .map(|c| c.to_uppercase().to_string())
+        .unwrap_or_default()
+        + chars.as_str();
+    format!("{day:02}-{cap}-{year}")
 }
 
 /// True if the content actually mentions the given date in a common format.
@@ -775,6 +817,13 @@ impl NamerApp {
                 self.update_info = None;
                 self.update_status = format!("You're up to date (v{APP_VERSION}).");
             }
+            Some(UpdateMsg::CheckFailed) => {
+                // Only report manual checks; the launch check stays silent.
+                if self.update_status == "Checking…" {
+                    self.update_status =
+                        "Couldn't reach GitHub — check your connection and try again.".into();
+                }
+            }
             None => {}
         }
     }
@@ -986,12 +1035,14 @@ impl eframe::App for NamerApp {
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .show(ctx, |ui| {
                     ui.label(
-                        "File Namer AI v1.0\n\n\
-                         Right-click any file and a local AI (Ollama)\n\
-                         proposes a better name based on its contents,\n\
-                         with a date when the content has one.\n\n\
-                         100% local — no cloud, no API keys.\n\n\
-                         Built for Shawn Rodis.",
+                        format!(
+                            "File Namer AI v{APP_VERSION}\n\n\
+                             Right-click any file and a local AI (Ollama)\n\
+                             proposes a better name based on its contents,\n\
+                             with a date when the content has one.\n\n\
+                             100% local — no cloud, no API keys.\n\n\
+                             Built for Shawn Rodis."
+                        ),
                     );
                     ui.add_space(8.0);
                     if ui.button("Close").clicked() {
