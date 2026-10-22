@@ -255,7 +255,8 @@ fn ollama_up(url: &str) -> bool {
 
 fn build_prompt(original: &str, content: &str, append_date: bool) -> String {
     let date_rule = if append_date {
-        "- If the content contains an obvious document date (invoice date, letter date, statement date), append it as _DD-Mon-YYYY, e.g. Report_Q3_19-Oct-2026. If no date is in the content, do NOT add one.\n"
+        "- If the content contains an obvious document date (invoice date, letter date, statement date), append it as _DD-Mon-YYYY, e.g. Report_Q3_19-Oct-2026.\n\
+         - Never invent, guess, or approximate a date. If no date appears in the content, output the name with no date at all.\n"
     } else {
         ""
     };
@@ -305,35 +306,6 @@ fn sanitize_filename(raw: &str) -> String {
     s.chars().take(80).collect()
 }
 
-fn has_date_suffix(s: &str) -> bool {
-    const MONTHS: [&str; 12] = [
-        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
-    ];
-    let b = s.as_bytes();
-    if b.len() < 11 {
-        return false;
-    }
-    for i in 0..=b.len() - 11 {
-        let w = &b[i..i + 11];
-        if w[0].is_ascii_digit()
-            && w[1].is_ascii_digit()
-            && w[2] == b'-'
-            && w[6] == b'-'
-            && w[7].is_ascii_digit()
-            && w[8].is_ascii_digit()
-            && w[9].is_ascii_digit()
-            && w[10].is_ascii_digit()
-        {
-            if let Ok(mon) = std::str::from_utf8(&w[3..6]) {
-                if MONTHS.contains(&mon.to_lowercase().as_str()) {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
 fn ask_ollama(cfg: &Config, path: &Path, content: &str) -> Result<String, String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(180))
@@ -366,16 +338,12 @@ fn ask_ollama(cfg: &Config, path: &Path, content: &str) -> Result<String, String
     }
     let v: serde_json::Value = resp.json().map_err(|e| format!("Bad response from Ollama: {e}"))?;
     let text = v["message"]["content"].as_str().unwrap_or("").trim();
-    let mut name = sanitize_filename(text);
+    let name = sanitize_filename(text);
     if name.is_empty() {
         return Err("The model returned an empty name.".into());
     }
-    if cfg.append_date && !has_date_suffix(&name) {
-        if let Some(dt) = file_datetime(path) {
-            name.push('_');
-            name.push_str(&dt.format("%d-%b-%Y").to_string());
-        }
-    }
+    // Never invent a date: if the model didn't find one in the content,
+    // the name stays dateless.
     Ok(name)
 }
 
@@ -414,6 +382,74 @@ fn install_menu() -> Result<(), String> {
 fn uninstall_menu() -> Result<(), String> {
     run_reg(&["delete", MENU_KEY, "/f"])?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// auto update check (GitHub Releases)
+// ---------------------------------------------------------------------------
+
+const UPDATE_REPO: &str = "shawnrodis/FileNamerAI";
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+enum UpdateMsg {
+    Available(String, String), // (version tag, release url)
+    UpToDate,
+}
+
+fn parse_ver(s: &str) -> (u64, u64, u64) {
+    let mut it = s
+        .trim()
+        .trim_start_matches('v')
+        .split('.')
+        .map(|p| p.parse::<u64>().unwrap_or(0));
+    (
+        it.next().unwrap_or(0),
+        it.next().unwrap_or(0),
+        it.next().unwrap_or(0),
+    )
+}
+
+fn check_updates(tx: mpsc::Sender<UpdateMsg>) {
+    let send = |m| {
+        let _ = tx.send(m);
+    };
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .user_agent("FileNamerAI-update-check")
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return, // stay silent offline
+    };
+    let v: serde_json::Value = match client
+        .get(format!(
+            "https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
+        ))
+        .send()
+    {
+        Ok(r) if r.status().is_success() => match r.json() {
+            Ok(v) => v,
+            Err(_) => return,
+        },
+        _ => return,
+    };
+    let tag = v["tag_name"].as_str().unwrap_or("").to_string();
+    let url = v["html_url"].as_str().unwrap_or("").to_string();
+    if tag.is_empty() || url.is_empty() {
+        return;
+    }
+    if parse_ver(&tag) > parse_ver(APP_VERSION) {
+        send(UpdateMsg::Available(tag, url));
+    } else {
+        send(UpdateMsg::UpToDate);
+    }
+}
+
+fn open_url(url: &str) {
+    let _ = Command::new("cmd")
+        .args(["/c", "start", "", url])
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn();
 }
 
 /// If "stem.ext" already exists next to the file, return "stem-02",
@@ -473,6 +509,11 @@ struct NamerApp {
     state: RenameState,
     suggestion: String,
     show_about: bool,
+    // update check
+    update_rx: Option<mpsc::Receiver<UpdateMsg>>,
+    update_info: Option<(String, String)>,
+    update_dismissed: bool,
+    update_status: String,
 }
 
 fn rename_worker(path: PathBuf, cfg: Config, tx: mpsc::Sender<WorkerMsg>) {
@@ -539,7 +580,18 @@ impl NamerApp {
             state: RenameState::Working,
             suggestion: String::new(),
             show_about: false,
+            update_rx: None,
+            update_info: None,
+            update_dismissed: false,
+            update_status: String::new(),
         };
+
+        if !app.is_rename_mode {
+            // Check for updates in the background (silent unless one is found).
+            let (utx, urx) = mpsc::channel();
+            app.update_rx = Some(urx);
+            thread::spawn(move || check_updates(utx));
+        }
 
         if app.is_rename_mode {
             let (tx, rx) = mpsc::channel();
@@ -615,9 +667,52 @@ impl NamerApp {
         save_config(&self.cfg);
     }
 
+    fn poll_updates(&mut self) {
+        let mut got: Option<UpdateMsg> = None;
+        if let Some(rx) = &self.update_rx {
+            while let Ok(m) = rx.try_recv() {
+                got = Some(m);
+            }
+        }
+        match got {
+            Some(UpdateMsg::Available(tag, url)) => {
+                self.update_info = Some((tag, url));
+                self.update_dismissed = false;
+                self.update_status.clear();
+            }
+            Some(UpdateMsg::UpToDate) => {
+                self.update_info = None;
+                self.update_status = format!("You're up to date (v{APP_VERSION}).");
+            }
+            None => {}
+        }
+    }
+
     fn ui_settings(&mut self, ui: &mut egui::Ui) {
+        self.poll_updates();
         ui.heading("File Namer AI");
         ui.label("Right-click any file → \"Rename with File Namer AI\" and a local AI proposes a better name.");
+
+        // update banner
+        let upd = self.update_info.clone();
+        if let Some((ver, url)) = upd {
+            if !self.update_dismissed {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("Update available: {ver} (you have v{APP_VERSION})"))
+                            .strong(),
+                    );
+                    if ui.button("Download").clicked() {
+                        open_url(&url);
+                    }
+                    if ui.button("Dismiss").clicked() {
+                        self.update_dismissed = true;
+                    }
+                });
+            }
+        }
+
         ui.add_space(8.0);
 
         egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -683,6 +778,17 @@ impl NamerApp {
 
         ui.add_space(8.0);
         ui.horizontal(|ui| {
+            if ui.button("Check for updates").clicked() {
+                let (tx2, rx2) = mpsc::channel();
+                self.update_rx = Some(rx2);
+                self.update_dismissed = false;
+                self.update_info = None;
+                self.update_status = "Checking…".into();
+                thread::spawn(move || check_updates(tx2));
+            }
+            if !self.update_status.is_empty() {
+                ui.label(&self.update_status);
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("About").clicked() {
                     self.show_about = true;
