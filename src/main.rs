@@ -1759,6 +1759,103 @@ impl eframe::App for BatchApp {
     }
 }
 
+/// Multi-select coordination: Windows may invoke the verb once per file
+/// despite MultiSelectModel=Player. The first instance becomes the
+/// coordinator; later instances drop their file paths and exit silently.
+/// The coordinator collects stragglers briefly, then opens one window.
+fn coordinate_files(files: Vec<PathBuf>) -> Vec<PathBuf> {
+    use std::time::{Duration, Instant};
+    // Fast path: Player model delivered everything at once (or nothing to do).
+    if files.len() != 1 {
+        return files;
+    }
+    let drop_dir = std::env::temp_dir().join("FileNamerAI-batch");
+    let _ = std::fs::create_dir_all(&drop_dir);
+    let lock_path = drop_dir.join("coordinator.lock");
+    let is_fresh = |p: &Path| {
+        std::fs::metadata(p)
+            .and_then(|m| m.modified())
+            .map(|t| t.elapsed().unwrap_or_default() < Duration::from_secs(10))
+            .unwrap_or(false)
+    };
+
+    // Try to become coordinator (atomic). Clear a stale lock first.
+    let lock = (|| -> Option<std::fs::File> {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(f) => Some(f),
+            Err(_) => {
+                if !is_fresh(&lock_path) {
+                    let _ = std::fs::remove_file(&lock_path);
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&lock_path)
+                        .ok()
+                } else {
+                    None
+                }
+            }
+        }
+    })();
+
+    let Some(lock) = lock else {
+        // Not the coordinator: hand our file over and exit quietly.
+        let tag: String = files[0]
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default()
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { '_' })
+            .collect();
+        let dest = drop_dir.join(format!("{}_{}.txt", std::process::id(), tag));
+        let _ = std::fs::write(&dest, files[0].to_string_lossy().as_bytes());
+        std::process::exit(0);
+    };
+
+    // Coordinator: sweep stale drops, then collect live stragglers.
+    if let Ok(rd) = std::fs::read_dir(&drop_dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p != lock_path
+                && p.extension().and_then(|s| s.to_str()) == Some("txt")
+                && !is_fresh(&p)
+            {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
+    let mut all = files;
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(900) {
+        if let Ok(rd) = std::fs::read_dir(&drop_dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p == lock_path
+                    || p.extension().and_then(|s| s.to_str()) != Some("txt")
+                    || !is_fresh(&p)
+                {
+                    continue;
+                }
+                if let Ok(content) = std::fs::read_to_string(&p) {
+                    let fp = PathBuf::from(content.trim());
+                    if fp.is_file() && !all.contains(&fp) {
+                        all.push(fp);
+                    }
+                }
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(60));
+    }
+    drop(lock);
+    let _ = std::fs::remove_file(&lock_path);
+    all
+}
+
 fn main() {
     // Registry migration for installs that predate multi-select support.
     ensure_multiselect();
@@ -1769,6 +1866,8 @@ fn main() {
         .map(PathBuf::from)
         .filter(|p| p.is_file())
         .collect();
+    // One window for a multi-select, even if the shell invoked us per-file.
+    let files = coordinate_files(files);
     let batch = files.len() > 1;
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("File Namer AI")
