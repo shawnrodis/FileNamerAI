@@ -25,6 +25,7 @@ struct Config {
     ollama_url: String,
     model: String,
     append_date: bool,
+    never_dates: bool,
 }
 
 impl Default for Config {
@@ -33,6 +34,7 @@ impl Default for Config {
             ollama_url: DEFAULT_OLLAMA_URL.into(),
             model: DEFAULT_MODEL.into(),
             append_date: true,
+            never_dates: false,
         }
     }
 }
@@ -52,6 +54,7 @@ fn load_config() -> Config {
                 "ollama_url" => cfg.ollama_url = v.trim().to_string(),
                 "model" => cfg.model = v.trim().to_string(),
                 "append_date" => cfg.append_date = v.trim() != "false",
+                "never_dates" => cfg.never_dates = v.trim() == "true",
                 _ => {}
             }
         }
@@ -67,10 +70,11 @@ fn load_config() -> Config {
 
 fn save_config(cfg: &Config) {
     let s = format!(
-        "ollama_url={}\nmodel={}\nappend_date={}\n",
+        "ollama_url={}\nmodel={}\nappend_date={}\nnever_dates={}\n",
         cfg.ollama_url.trim(),
         cfg.model.trim(),
-        cfg.append_date
+        cfg.append_date,
+        cfg.never_dates
     );
     let _ = std::fs::write(config_path(), s);
 }
@@ -102,8 +106,9 @@ fn is_dark_mode() -> bool {
 enum Extracted {
     /// Text for the AI to read (documents).
     Text(String),
-    /// Deterministic date-based naming, no AI (photos, videos).
-    DateTime(chrono::NaiveDateTime),
+    /// Deterministic date-based naming, no AI (photos, videos), plus the
+    /// human-readable source of the date ("EXIF date taken", ...).
+    DateTime(chrono::NaiveDateTime, &'static str),
 }
 
 fn exif_datetime(path: &Path) -> Option<chrono::NaiveDateTime> {
@@ -117,12 +122,30 @@ fn exif_datetime(path: &Path) -> Option<chrono::NaiveDateTime> {
     chrono::NaiveDateTime::parse_from_str(s.trim(), "%Y:%m:%d %H:%M:%S").ok()
 }
 
-fn file_datetime(path: &Path) -> Option<chrono::NaiveDateTime> {
-    let md = std::fs::metadata(path).ok()?;
-    // Prefer Created, fall back to Modified (Created is unsupported on some filesystems).
-    let st = md.created().or_else(|_| md.modified()).ok()?;
-    let dt: chrono::DateTime<chrono::Local> = st.into();
-    Some(dt.naive_local())
+/// Best available timestamp: EXIF (photos) / embedded media date (videos),
+/// then file Created, then Modified, then now. Returns the source label too.
+fn best_datetime(path: &Path, is_video: bool) -> (chrono::NaiveDateTime, &'static str) {
+    if is_video {
+        if let Some(dt) = mp4_creation_datetime(path) {
+            return (dt, "video media date");
+        }
+    } else if let Some(dt) = exif_datetime(path) {
+        return (dt, "EXIF date taken");
+    }
+    if let Ok(md) = std::fs::metadata(path) {
+        if let Ok(st) = md.created() {
+            let dt: chrono::DateTime<chrono::Local> = st.into();
+            return (dt.naive_local(), "file created date");
+        }
+        if let Ok(st) = md.modified() {
+            let dt: chrono::DateTime<chrono::Local> = st.into();
+            return (dt.naive_local(), "file modified date");
+        }
+    }
+    (
+        chrono::Local::now().naive_local(),
+        "current time (no date found)",
+    )
 }
 
 /// Embedded creation time from an MP4/MOV/M4V/3GP (moov/mvhd box).
@@ -184,17 +207,6 @@ fn mp4_creation_datetime(path: &Path) -> Option<chrono::NaiveDateTime> {
 
 /// Best available timestamp: EXIF (photos) / embedded media date (videos),
 /// then file Created, then Modified, then now.
-fn best_datetime(path: &Path, is_video: bool) -> chrono::NaiveDateTime {
-    if is_video {
-        if let Some(dt) = mp4_creation_datetime(path) {
-            return dt;
-        }
-    } else if let Some(dt) = exif_datetime(path) {
-        return dt;
-    }
-    file_datetime(path).unwrap_or_else(|| chrono::Local::now().naive_local())
-}
-
 fn extract_content(path: &Path) -> Result<Extracted, String> {
     let ext = path
         .extension()
@@ -223,11 +235,13 @@ fn extract_content(path: &Path) -> Result<Extracted, String> {
         }
         "jpg" | "jpeg" | "png" | "tif" | "tiff" | "webp" | "heic" | "heif" => {
             // Photos: EXIF "Date Taken", else file dates. No AI.
-            Ok(Extracted::DateTime(best_datetime(path, false)))
+            let (dt, src) = best_datetime(path, false);
+            Ok(Extracted::DateTime(dt, src))
         }
         "mp4" | "mov" | "m4v" | "3gp" | "avi" | "mkv" | "webm" => {
             // Videos: embedded media-created date, else file dates. No AI.
-            Ok(Extracted::DateTime(best_datetime(path, true)))
+            let (dt, src) = best_datetime(path, true);
+            Ok(Extracted::DateTime(dt, src))
         }
         _ => Err(format!(
             "Unsupported file type: .{ext} (PDF, text, photos and videos work)"
@@ -320,7 +334,7 @@ fn ask_ollama(cfg: &Config, path: &Path, content: &str) -> Result<String, String
         "model": cfg.model,
         "messages": [
             {"role": "system", "content": "You are a file renaming assistant. You output only the proposed filename, nothing else."},
-            {"role": "user", "content": build_prompt(original, content, cfg.append_date)}
+            {"role": "user", "content": build_prompt(original, content, cfg.append_date && !cfg.never_dates)}
         ],
         "stream": false,
         "options": {"temperature": 0.2}
@@ -343,8 +357,10 @@ fn ask_ollama(cfg: &Config, path: &Path, content: &str) -> Result<String, String
         return Err("The model returned an empty name.".into());
     }
     // Verify any date the model added: it must actually appear in the content.
-    // If not, strip it — never ship an invented date.
+    // If not — or if the user disabled dates entirely — strip it.
+    // Never ship an invented date.
     let name = match split_date_suffix(&name) {
+        Some((stem, _, _, _)) if cfg.never_dates => stem.to_string(),
         Some((stem, d, m, y)) if !date_in_content(content, d, m, y) => stem.to_string(),
         _ => name,
     };
@@ -536,7 +552,7 @@ fn unique_stem(path: &Path, stem: &str, ext: &str) -> String {
 
 enum WorkerMsg {
     Suggestion(String),
-    DateOnly(String),
+    DateOnly(String, String), // (proposed stem, date source label)
     NeedOllama,
     Failed(String),
 }
@@ -558,12 +574,14 @@ struct NamerApp {
     url_edit: String,
     model_edit: String,
     append_date: bool,
+    never_dates: bool,
     settings_status: String,
     menu_on: bool,
     // rename flow
     rx: Option<mpsc::Receiver<WorkerMsg>>,
     state: RenameState,
     suggestion: String,
+    date_source: Option<String>,
     show_about: bool,
     // update check
     update_rx: Option<mpsc::Receiver<UpdateMsg>>,
@@ -584,9 +602,12 @@ fn rename_worker(path: PathBuf, cfg: Config, tx: mpsc::Sender<WorkerMsg>) {
         }
     };
     match extracted {
-        Extracted::DateTime(dt) => {
+        Extracted::DateTime(dt, src) => {
             // BRU-style: MM-DD-YY-HH-MM-SS, straight to the confirm dialog. No AI.
-            send(WorkerMsg::DateOnly(dt.format("%m-%d-%y-%H-%M-%S").to_string()));
+            send(WorkerMsg::DateOnly(
+                dt.format("%m-%d-%y-%H-%M-%S").to_string(),
+                src.to_string(),
+            ));
         }
         Extracted::Text(content) => {
             if !ollama_up(&cfg.ollama_url) {
@@ -629,12 +650,14 @@ impl NamerApp {
             url_edit: cfg.ollama_url.clone(),
             model_edit: cfg.model.clone(),
             append_date: cfg.append_date,
+            never_dates: cfg.never_dates,
             cfg,
             settings_status: String::new(),
             menu_on: menu_installed(),
             rx: None,
             state: RenameState::Working,
             suggestion: String::new(),
+            date_source: None,
             show_about: false,
             update_rx: None,
             update_info: None,
@@ -657,6 +680,7 @@ impl NamerApp {
                 ollama_url: app.cfg.ollama_url.clone(),
                 model: app.cfg.model.clone(),
                 append_date: app.cfg.append_date,
+                never_dates: app.cfg.never_dates,
             };
             thread::spawn(move || rename_worker(path, cfg, tx));
         }
@@ -671,13 +695,23 @@ impl NamerApp {
             }
         }
         match got {
-            Some(WorkerMsg::Suggestion(name)) | Some(WorkerMsg::DateOnly(name)) => {
+            Some(WorkerMsg::Suggestion(name)) => {
                 // Resolve collisions up front so the dialog shows the final name.
                 let stem = sanitize_filename(&name);
                 self.suggestion = match &self.file_path {
                     Some(p) => unique_stem(p, &stem, &self.file_ext.clone()),
                     None => stem,
                 };
+                self.date_source = None;
+                self.state = RenameState::Confirm;
+            }
+            Some(WorkerMsg::DateOnly(name, src)) => {
+                let stem = sanitize_filename(&name);
+                self.suggestion = match &self.file_path {
+                    Some(p) => unique_stem(p, &stem, &self.file_ext.clone()),
+                    None => stem,
+                };
+                self.date_source = Some(src);
                 self.state = RenameState::Confirm;
             }
             Some(WorkerMsg::NeedOllama) => self.state = RenameState::NeedOllama,
@@ -720,6 +754,7 @@ impl NamerApp {
         self.cfg.ollama_url = self.url_edit.trim().to_string();
         self.cfg.model = self.model_edit.trim().to_string();
         self.cfg.append_date = self.append_date;
+        self.cfg.never_dates = self.never_dates;
         save_config(&self.cfg);
     }
 
@@ -792,6 +827,7 @@ impl NamerApp {
                 }
             });
             ui.checkbox(&mut self.append_date, "Append date (_DD-Mon-YYYY) when the content has one");
+            ui.checkbox(&mut self.never_dates, "Never add dates to document names");
             if ui.button("Save settings").clicked() {
                 self.save_settings_from_ui();
                 self.settings_status = "Settings saved.".into();
@@ -893,6 +929,13 @@ impl NamerApp {
                         ui.label(format!(".{}", self.file_ext));
                     }
                 });
+                if let Some(src) = &self.date_source {
+                    ui.label(
+                        egui::RichText::new(format!("Date source: {src}"))
+                            .weak()
+                            .small(),
+                    );
+                }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.button("Rename").clicked() {
