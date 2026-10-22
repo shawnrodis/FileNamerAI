@@ -100,13 +100,13 @@ fn is_dark_mode() -> bool {
 // ---------------------------------------------------------------------------
 
 enum Extracted {
-    /// Text for the AI to read.
+    /// Text for the AI to read (documents).
     Text(String),
-    /// No readable text (e.g. photo): date-based naming only.
-    DateOnly(chrono::NaiveDate),
+    /// Deterministic date-based naming, no AI (photos, videos).
+    DateTime(chrono::NaiveDateTime),
 }
 
-fn exif_date(path: &Path) -> Option<chrono::NaiveDate> {
+fn exif_datetime(path: &Path) -> Option<chrono::NaiveDateTime> {
     let file = std::fs::File::open(path).ok()?;
     let mut reader = BufReader::new(file);
     let exif = exif::Reader::new().read_from_container(&mut reader).ok()?;
@@ -114,22 +114,85 @@ fn exif_date(path: &Path) -> Option<chrono::NaiveDate> {
         .get_field(exif::Tag::DateTimeOriginal, exif::In::PRIMARY)
         .or_else(|| exif.get_field(exif::Tag::DateTime, exif::In::PRIMARY))?;
     let s = field.display_value().to_string(); // "2026:10:22 15:26:11"
-    chrono::NaiveDateTime::parse_from_str(s.trim(), "%Y:%m:%d %H:%M:%S")
-        .ok()
-        .map(|dt| dt.date())
+    chrono::NaiveDateTime::parse_from_str(s.trim(), "%Y:%m:%d %H:%M:%S").ok()
 }
 
-fn modified_date(path: &Path) -> Option<chrono::NaiveDate> {
+fn file_datetime(path: &Path) -> Option<chrono::NaiveDateTime> {
     let md = std::fs::metadata(path).ok()?;
-    let st = md.modified().ok()?;
+    // Prefer Created, fall back to Modified (Created is unsupported on some filesystems).
+    let st = md.created().or_else(|_| md.modified()).ok()?;
     let dt: chrono::DateTime<chrono::Local> = st.into();
-    Some(dt.date_naive())
+    Some(dt.naive_local())
 }
 
-fn best_date(path: &Path) -> chrono::NaiveDate {
-    exif_date(path)
-        .or_else(|| modified_date(path))
-        .unwrap_or_else(|| chrono::Local::now().date_naive())
+/// Embedded creation time from an MP4/MOV/M4V/3GP (moov/mvhd box).
+/// QuickTime epoch is 1904-01-01; a zero value means "not set".
+fn mp4_creation_datetime(path: &Path) -> Option<chrono::NaiveDateTime> {
+    const QT_TO_UNIX: i64 = 2_082_844_800; // seconds between 1904-01-01 and 1970-01-01
+    let data = std::fs::read(path).ok()?;
+    let mut pos = 0usize;
+    // find the 'moov' top-level box
+    let moov: &[u8] = loop {
+        if pos + 8 > data.len() {
+            return None;
+        }
+        let size = u32::from_be_bytes(data[pos..pos + 4].try_into().ok()?) as usize;
+        if size < 8 || pos + size > data.len() {
+            return None;
+        }
+        if &data[pos + 4..pos + 8] == b"moov" {
+            break &data[pos + 8..pos + size];
+        }
+        if size == 0 {
+            return None;
+        }
+        pos += size;
+    };
+    // find 'mvhd' inside moov
+    let mut pos = 0usize;
+    while pos + 8 <= moov.len() {
+        let size = u32::from_be_bytes(moov[pos..pos + 4].try_into().ok()?) as usize;
+        if size < 8 || pos + size > moov.len() {
+            return None;
+        }
+        if &moov[pos + 4..pos + 8] == b"mvhd" {
+            let body = &moov[pos + 8..pos + size];
+            if body.is_empty() {
+                return None;
+            }
+            let creation: u64 = if body[0] == 1 {
+                if body.len() < 12 {
+                    return None;
+                }
+                u64::from_be_bytes(body[4..12].try_into().ok()?)
+            } else {
+                if body.len() < 8 {
+                    return None;
+                }
+                u32::from_be_bytes(body[4..8].try_into().ok()?) as u64
+            };
+            if creation == 0 {
+                return None;
+            }
+            return chrono::DateTime::from_timestamp(creation as i64 - QT_TO_UNIX, 0)
+                .map(|dt| dt.naive_local());
+        }
+        pos += size;
+    }
+    None
+}
+
+/// Best available timestamp: EXIF (photos) / embedded media date (videos),
+/// then file Created, then Modified, then now.
+fn best_datetime(path: &Path, is_video: bool) -> chrono::NaiveDateTime {
+    if is_video {
+        if let Some(dt) = mp4_creation_datetime(path) {
+            return dt;
+        }
+    } else if let Some(dt) = exif_datetime(path) {
+        return dt;
+    }
+    file_datetime(path).unwrap_or_else(|| chrono::Local::now().naive_local())
 }
 
 fn extract_content(path: &Path) -> Result<Extracted, String> {
@@ -159,10 +222,15 @@ fn extract_content(path: &Path) -> Result<Extracted, String> {
             Ok(Extracted::Text(text))
         }
         "jpg" | "jpeg" | "png" | "tif" | "tiff" | "webp" | "heic" | "heif" => {
-            Ok(Extracted::DateOnly(best_date(path)))
+            // Photos: EXIF "Date Taken", else file dates. No AI.
+            Ok(Extracted::DateTime(best_datetime(path, false)))
+        }
+        "mp4" | "mov" | "m4v" | "3gp" | "avi" | "mkv" | "webm" => {
+            // Videos: embedded media-created date, else file dates. No AI.
+            Ok(Extracted::DateTime(best_datetime(path, true)))
         }
         _ => Err(format!(
-            "Unsupported file type: .{ext} (PDF, text, Word-style and image files work)"
+            "Unsupported file type: .{ext} (PDF, text, photos and videos work)"
         )),
     }
 }
@@ -303,9 +371,9 @@ fn ask_ollama(cfg: &Config, path: &Path, content: &str) -> Result<String, String
         return Err("The model returned an empty name.".into());
     }
     if cfg.append_date && !has_date_suffix(&name) {
-        if let Some(d) = modified_date(path) {
+        if let Some(dt) = file_datetime(path) {
             name.push('_');
-            name.push_str(&d.format("%d-%b-%Y").to_string());
+            name.push_str(&dt.format("%d-%b-%Y").to_string());
         }
     }
     Ok(name)
@@ -346,6 +414,28 @@ fn install_menu() -> Result<(), String> {
 fn uninstall_menu() -> Result<(), String> {
     run_reg(&["delete", MENU_KEY, "/f"])?;
     Ok(())
+}
+
+/// If "stem.ext" already exists next to the file, return "stem-02",
+/// "stem-03", ... (burst shots share a timestamp).
+fn unique_stem(path: &Path, stem: &str, ext: &str) -> String {
+    let name_for = |s: &str| {
+        if ext.is_empty() {
+            s.to_string()
+        } else {
+            format!("{s}.{ext}")
+        }
+    };
+    if !path.with_file_name(name_for(stem)).exists() {
+        return stem.to_string();
+    }
+    for n in 2..100 {
+        let s = format!("{stem}-{n:02}");
+        if !path.with_file_name(name_for(&s)).exists() {
+            return s;
+        }
+    }
+    stem.to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -397,22 +487,9 @@ fn rename_worker(path: PathBuf, cfg: Config, tx: mpsc::Sender<WorkerMsg>) {
         }
     };
     match extracted {
-        Extracted::DateOnly(d) => {
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("IMG");
-            let clean: String = stem
-                .chars()
-                .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
-                .take(30)
-                .collect();
-            let prefix = if clean.is_empty() { "IMG".into() } else { clean };
-            send(WorkerMsg::DateOnly(format!(
-                "{}_{}",
-                prefix,
-                d.format("%d-%b-%Y")
-            )));
+        Extracted::DateTime(dt) => {
+            // BRU-style: MM-DD-YY-HH-MM-SS, straight to the confirm dialog. No AI.
+            send(WorkerMsg::DateOnly(dt.format("%m-%d-%y-%H-%M-%S").to_string()));
         }
         Extracted::Text(content) => {
             if !ollama_up(&cfg.ollama_url) {
@@ -486,12 +563,13 @@ impl NamerApp {
             }
         }
         match got {
-            Some(WorkerMsg::Suggestion(name)) => {
-                self.suggestion = name;
-                self.state = RenameState::Confirm;
-            }
-            Some(WorkerMsg::DateOnly(name)) => {
-                self.suggestion = name;
+            Some(WorkerMsg::Suggestion(name)) | Some(WorkerMsg::DateOnly(name)) => {
+                // Resolve collisions up front so the dialog shows the final name.
+                let stem = sanitize_filename(&name);
+                self.suggestion = match &self.file_path {
+                    Some(p) => unique_stem(p, &stem, &self.file_ext.clone()),
+                    None => stem,
+                };
                 self.state = RenameState::Confirm;
             }
             Some(WorkerMsg::NeedOllama) => self.state = RenameState::NeedOllama,
@@ -514,18 +592,13 @@ impl NamerApp {
             self.state = RenameState::Error("The name is empty.".into());
             return;
         }
+        let stem = unique_stem(&path, &stem, &self.file_ext);
         let new_name = if self.file_ext.is_empty() {
             stem.clone()
         } else {
             format!("{stem}.{}", self.file_ext)
         };
         let new_path = path.with_file_name(&new_name);
-        if new_path.exists() {
-            self.state = RenameState::Error(format!(
-                "A file named \"{new_name}\" already exists here."
-            ));
-            return;
-        }
         match std::fs::rename(&path, &new_path) {
             Ok(()) => {
                 self.file_path = Some(new_path);

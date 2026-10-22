@@ -25,9 +25,18 @@ needed, just run it. (Building from source is optional; instructions below.)
    descriptive name, and shows a confirm dialog — edit the name if you like,
    then Rename.
 
-Supported files: PDF (text-based), TXT/MD/CSV/LOG/JSON/XML/HTML, and images
-(named from EXIF date, e.g. `IMG_19-Oct-2026`). Dates found in content are
-appended as `_DD-Mon-YYYY`.
+Supported files:
+- **Documents** (PDF, TXT/MD/CSV/LOG/JSON/XML/HTML): the local AI reads the
+  content and proposes a descriptive name, with a date appended when the
+  content has one.
+- **Photos** (JPG/PNG/TIF/WebP/HEIC…): renamed by **EXIF Date Taken**, no AI
+  needed — e.g. `01-10-26-20-10-12.jpg`. Falls back to file dates when there's
+  no EXIF data.
+- **Videos** (MP4/MOV/M4V/3GP/AVI/MKV/WebM): renamed by the video's embedded
+  media-created date, else file dates — same `MM-DD-YY-HH-MM-SS` format, no AI.
+
+Name collisions (burst shots sharing a timestamp) get `-02`, `-03` suffixes
+automatically.
 
 Note: on Windows 11 the menu item lives under "Show more options".
 
