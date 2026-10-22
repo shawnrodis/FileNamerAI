@@ -699,7 +699,8 @@ fn strip_partial_date(s: &str) -> Option<&str> {
 }
 
 /// If "stem.ext" already exists next to the file, return "stem-02",
-/// "stem-03", ... (burst shots share a timestamp).
+/// "stem-03", ... (burst shots share a timestamp). The file's own current
+/// name is never treated as a collision.
 fn unique_stem(path: &Path, stem: &str, ext: &str) -> String {
     let name_for = |s: &str| {
         if ext.is_empty() {
@@ -708,12 +709,16 @@ fn unique_stem(path: &Path, stem: &str, ext: &str) -> String {
             format!("{s}.{ext}")
         }
     };
-    if !path.with_file_name(name_for(stem)).exists() {
+    let ok = |s: &str| {
+        let cand = path.with_file_name(name_for(s));
+        cand == path || !cand.exists()
+    };
+    if ok(stem) {
         return stem.to_string();
     }
     for n in 2..100 {
         let s = format!("{stem}-{n:02}");
-        if !path.with_file_name(name_for(&s)).exists() {
+        if ok(&s) {
             return s;
         }
     }
@@ -925,6 +930,11 @@ impl NamerApp {
             format!("{stem}.{}", self.file_ext)
         };
         let new_path = path.with_file_name(&new_name);
+        if new_path == path {
+            // Name unchanged: nothing to do.
+            self.state = RenameState::Done(new_name);
+            return;
+        }
         match std::fs::rename(&path, &new_path) {
             Ok(()) => {
                 self.file_path = Some(new_path);
