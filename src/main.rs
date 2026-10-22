@@ -524,23 +524,25 @@ fn install_menu() -> Result<(), String> {
 }
 
 /// Existing installs predate multi-select support (v1.3.0 even set the
-/// wrong model). Enforce Player silently on launch.
+/// wrong model). Enforce Player on every launch — idempotent and cheap.
 fn ensure_multiselect() {
     if !menu_installed() {
         return;
     }
-    let cur = run_reg(&["query", MENU_KEY, "/v", "MultiSelectModel"])
+    let _ = run_reg(&[
+        "add", MENU_KEY, "/v", "MultiSelectModel", "/d", "Player", "/f",
+    ]);
+}
+
+/// Current MultiSelectModel value, for the Settings diagnostic line.
+fn multiselect_model() -> Option<String> {
+    run_reg(&["query", MENU_KEY, "/v", "MultiSelectModel"])
         .ok()
         .and_then(|out| {
             out.lines()
                 .find(|l| l.contains("MultiSelectModel"))
                 .and_then(|l| l.split_whitespace().last().map(|s| s.to_string()))
-        });
-    if cur.as_deref() != Some("Player") {
-        let _ = run_reg(&[
-            "add", MENU_KEY, "/v", "MultiSelectModel", "/d", "Player", "/f",
-        ]);
-    }
+        })
 }
 
 fn uninstall_menu() -> Result<(), String> {
@@ -773,10 +775,29 @@ fn strip_partial_date(s: &str) -> Option<&str> {
     }
 }
 
+/// "T_1" -> "T"; "T" -> "T". Used so a BRU-style collision suffix doesn't
+/// stop us recognizing an already-correctly-named file.
+fn strip_numeric_suffix(stem: &str) -> &str {
+    if let Some(i) = stem.rfind('_') {
+        let (base, suffix) = stem.split_at(i);
+        let digits = &suffix[1..];
+        if !base.is_empty() && !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
+            return base;
+        }
+    }
+    stem
+}
+
 /// If "stem.ext" already exists next to the file, return "stem_1",
 /// "stem_2", ... (BRU-style: collisions get _1, _2). The file's own current
-/// name is never treated as a collision.
+/// name is never treated as a collision — including when it carries a _N
+/// suffix from an earlier batch (already correctly named -> keep as-is).
 fn unique_stem(path: &Path, stem: &str, ext: &str) -> String {
+    if let Some(cur) = path.file_stem().and_then(|s| s.to_str()) {
+        if cur == stem || strip_numeric_suffix(cur) == stem {
+            return cur.to_string();
+        }
+    }
     let name_for = |s: &str| {
         if ext.is_empty() {
             s.to_string()
@@ -984,16 +1005,20 @@ fn resolve_batch(rows: &[BatchRow]) -> Vec<RowStatus> {
             }
         }
         // No-op detection first (case-insensitive; Windows is too).
+        // A trailing _N collision suffix is ignored: T_1.mp4 with a computed
+        // stem of T is already correctly named.
         let mut is_noop = HashMap::new();
         for &i in &indices {
             let r = &rows[i];
             let s = eff[i].as_ref().unwrap();
-            let full = if r.ext.is_empty() {
-                s.clone()
-            } else {
-                format!("{s}.{}", r.ext)
-            };
-            let noop = full.to_lowercase() == r.current_name.to_lowercase();
+            let cur_stem = r
+                .path
+                .file_stem()
+                .and_then(|x| x.to_str())
+                .unwrap_or(&r.current_name);
+            let s_low = s.to_lowercase();
+            let cur_low = cur_stem.to_lowercase();
+            let noop = s_low == cur_low || s_low == strip_numeric_suffix(&cur_low);
             is_noop.insert(i, noop);
             if noop {
                 out[i] = RowStatus::NoOp;
@@ -1322,6 +1347,16 @@ impl NamerApp {
                 }
             });
             ui.label("Note: on Windows 11 the item lives under \"Show more options\".");
+            if self.menu_on {
+                match multiselect_model() {
+                    Some(m) => {
+                        ui.label(format!("Multi-select mode: {m} (want \"Player\" for one batch window)."));
+                    }
+                    None => {
+                        ui.label("Multi-select mode: not set.");
+                    }
+                }
+            }
         });
 
         ui.add_space(8.0);
