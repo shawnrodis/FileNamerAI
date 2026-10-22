@@ -1610,111 +1610,31 @@ impl eframe::App for BatchApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_workers(ctx);
         let mut needs_resolve = false;
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading(format!("Batch rename — {} files", self.rows.len()));
+
+        let to_rename = self
+            .statuses
+            .iter()
+            .filter(|s| matches!(s, RowStatus::Ready { .. }))
+            .count();
+        let noop = self
+            .statuses
+            .iter()
+            .filter(|s| matches!(s, RowStatus::NoOp))
+            .count();
+        let errs = self
+            .statuses
+            .iter()
+            .filter(|s| matches!(s, RowStatus::Error))
+            .count();
+        let working = self
+            .statuses
+            .iter()
+            .filter(|s| matches!(s, RowStatus::Working))
+            .count();
+
+        // Bottom bar first so the scroll area can't squeeze it out.
+        egui::TopBottomPanel::bottom("batch_bottom").show(ctx, |ui| {
             ui.add_space(4.0);
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    egui::Grid::new("batch_grid")
-                        .striped(true)
-                        .spacing([10.0, 6.0])
-                        .show(ui, |ui| {
-                            ui.label(egui::RichText::new("File").strong());
-                            ui.label(egui::RichText::new("Proposed name").strong());
-                            ui.label(egui::RichText::new("Final name").strong());
-                            ui.label(egui::RichText::new("Source").strong());
-                            ui.end_row();
-                            for i in 0..self.rows.len() {
-                                ui.label(
-                                    egui::RichText::new(&self.rows[i].current_name).small(),
-                                );
-                                ui.horizontal(|ui| {
-                                    let resp = ui.add(
-                                        egui::TextEdit::singleline(&mut self.rows[i].edit_buf)
-                                            .desired_width(200.0),
-                                    );
-                                    if resp.changed() {
-                                        self.rows[i].manual = true;
-                                        self.rows[i].ready = true;
-                                        needs_resolve = true;
-                                    }
-                                    if !self.rows[i].ext.is_empty() {
-                                        ui.label(format!(".{}", self.rows[i].ext));
-                                    }
-                                });
-                                // Final-name column.
-                                match &self.statuses[i] {
-                                    RowStatus::Working => {
-                                        ui.label(egui::RichText::new("…").weak());
-                                    }
-                                    RowStatus::Error => {
-                                        ui.label(
-                                            egui::RichText::new("error")
-                                                .color(egui::Color32::RED),
-                                        );
-                                    }
-                                    RowStatus::NoOp => {
-                                        ui.label(
-                                            egui::RichText::new("already named").weak(),
-                                        );
-                                    }
-                                    RowStatus::Ready { final_name, suffixed } => {
-                                        if self.finished
-                                            && self.rows[i].renamed_to.is_some()
-                                        {
-                                            ui.label(
-                                                egui::RichText::new(format!("✓ {final_name}"))
-                                                    .color(egui::Color32::GREEN),
-                                            );
-                                        } else {
-                                            let mut t =
-                                                egui::RichText::new(final_name).small();
-                                            if *suffixed {
-                                                t = t.strong();
-                                            }
-                                            ui.label(t);
-                                        }
-                                    }
-                                }
-                                // Source / error column.
-                                if let Some(e) = &self.rows[i].error {
-                                    ui.label(
-                                        egui::RichText::new(e)
-                                            .color(egui::Color32::RED)
-                                            .small(),
-                                    );
-                                } else if let Some(s) = &self.rows[i].date_source {
-                                    ui.label(egui::RichText::new(s).small().weak());
-                                } else {
-                                    ui.label("");
-                                }
-                                ui.end_row();
-                            }
-                        });
-                });
-            ui.add_space(6.0);
-            ui.separator();
-            let to_rename = self
-                .statuses
-                .iter()
-                .filter(|s| matches!(s, RowStatus::Ready { .. }))
-                .count();
-            let noop = self
-                .statuses
-                .iter()
-                .filter(|s| matches!(s, RowStatus::NoOp))
-                .count();
-            let errs = self
-                .statuses
-                .iter()
-                .filter(|s| matches!(s, RowStatus::Error))
-                .count();
-            let working = self
-                .statuses
-                .iter()
-                .filter(|s| matches!(s, RowStatus::Working))
-                .count();
             if !self.finished {
                 ui.label(format!(
                     "{to_rename} to rename • {noop} already named • {errs} errors"
@@ -1735,7 +1655,7 @@ impl eframe::App for BatchApp {
                         ui.label(format!("Working on {working}…"));
                     }
                 });
-                ui.add_space(4.0);
+                ui.add_space(2.0);
                 ui.label(
                     egui::RichText::new(
                         "Tip: edit any proposed name — collisions are re-checked across all files.",
@@ -1752,6 +1672,87 @@ impl eframe::App for BatchApp {
                     std::process::exit(0);
                 }
             }
+            ui.add_space(4.0);
+        });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading(format!("Batch rename — {} files", self.rows.len()));
+            ui.add_space(4.0);
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                egui::Grid::new("batch_grid")
+                    .striped(true)
+                    .spacing([10.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new("File").strong());
+                        ui.label(egui::RichText::new("Proposed name").strong());
+                        ui.label(egui::RichText::new("Final name").strong());
+                        ui.label(egui::RichText::new("Source").strong());
+                        ui.end_row();
+                        for i in 0..self.rows.len() {
+                            ui.label(egui::RichText::new(&self.rows[i].current_name).small());
+                            ui.horizontal(|ui| {
+                                let resp = ui.add(
+                                    egui::TextEdit::singleline(&mut self.rows[i].edit_buf)
+                                        .desired_width(200.0),
+                                );
+                                if resp.changed() {
+                                    self.rows[i].manual = true;
+                                    self.rows[i].ready = true;
+                                    needs_resolve = true;
+                                }
+                                if !self.rows[i].ext.is_empty() {
+                                    ui.label(format!(".{}", self.rows[i].ext));
+                                }
+                            });
+                            // Final-name column: always show the real filename.
+                            match &self.statuses[i] {
+                                RowStatus::Working => {
+                                    ui.label(egui::RichText::new("…").weak());
+                                }
+                                RowStatus::Error => {
+                                    ui.label(
+                                        egui::RichText::new("error").color(egui::Color32::RED),
+                                    );
+                                }
+                                RowStatus::NoOp => {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "✓ {}",
+                                            self.rows[i].current_name
+                                        ))
+                                        .small()
+                                        .weak(),
+                                    );
+                                }
+                                RowStatus::Ready { final_name, suffixed } => {
+                                    if self.finished && self.rows[i].renamed_to.is_some() {
+                                        ui.label(
+                                            egui::RichText::new(format!("✓ {final_name}"))
+                                                .color(egui::Color32::GREEN),
+                                        );
+                                    } else {
+                                        let mut t = egui::RichText::new(final_name).small();
+                                        if *suffixed {
+                                            t = t.strong();
+                                        }
+                                        ui.label(t);
+                                    }
+                                }
+                            }
+                            // Source / error column.
+                            if let Some(e) = &self.rows[i].error {
+                                ui.label(
+                                    egui::RichText::new(e).color(egui::Color32::RED).small(),
+                                );
+                            } else if let Some(s) = &self.rows[i].date_source {
+                                ui.label(egui::RichText::new(s).small().weak());
+                            } else {
+                                ui.label("");
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
         });
         if needs_resolve {
             self.re_resolve();
