@@ -511,10 +511,11 @@ fn install_menu() -> Result<(), String> {
     let exe_s = exe.to_string_lossy();
     run_reg(&["add", MENU_KEY, "/ve", "/d", "Rename with File Namer AI", "/f"])?;
     run_reg(&["add", MENU_KEY, "/v", "Icon", "/d", &exe_s, "/f"])?;
-    // "Document" = one invocation with every selected file, so multi-select
+    // "Player" = one invocation with EVERY selected file, so multi-select
     // opens a single batch window instead of one window per file.
+    // (Document would be one invocation per file — the opposite.)
     run_reg(&[
-        "add", MENU_KEY, "/v", "MultiSelectModel", "/d", "Document", "/f",
+        "add", MENU_KEY, "/v", "MultiSelectModel", "/d", "Player", "/f",
     ])?;
     let cmd_key = format!("{MENU_KEY}\\command");
     let cmd = format!("\"{exe_s}\" \"%1\"");
@@ -522,15 +523,22 @@ fn install_menu() -> Result<(), String> {
     Ok(())
 }
 
-/// Existing installs predate MultiSelectModel: add it silently on launch.
+/// Existing installs predate multi-select support (v1.3.0 even set the
+/// wrong model). Enforce Player silently on launch.
 fn ensure_multiselect() {
     if !menu_installed() {
         return;
     }
-    let out = run_reg(&["query", MENU_KEY, "/v", "MultiSelectModel"]);
-    if out.is_err() {
+    let cur = run_reg(&["query", MENU_KEY, "/v", "MultiSelectModel"])
+        .ok()
+        .and_then(|out| {
+            out.lines()
+                .find(|l| l.contains("MultiSelectModel"))
+                .and_then(|l| l.split_whitespace().last().map(|s| s.to_string()))
+        });
+    if cur.as_deref() != Some("Player") {
         let _ = run_reg(&[
-            "add", MENU_KEY, "/v", "MultiSelectModel", "/d", "Document", "/f",
+            "add", MENU_KEY, "/v", "MultiSelectModel", "/d", "Player", "/f",
         ]);
     }
 }
