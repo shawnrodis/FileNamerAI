@@ -357,20 +357,21 @@ fn ask_ollama(cfg: &Config, path: &Path, content: &str) -> Result<String, String
     if name.is_empty() {
         return Err("The model returned an empty name.".into());
     }
-    // No shouting: Title Case anything all-caps.
-    let mut name = de_shout(&name);
+    // No shouting here yet — the date suffix is split off first below, since
+    // its own lowercase (e.g. "Aug") would defeat the all-caps check.
+    let mut name = name;
     // A trailing bare year (_2026) or month-year (_Oct-2026) isn't a usable
     // date — drop it so the best-effort fallback can supply the file's date.
     if let Some(stem) = strip_partial_date(&name) {
         name = stem.to_string();
     }
-    // Split off any full trailing date, then normalize the stem: underscores
-    // are only allowed right before the date.
+    // Split off any full trailing date, then de-shout and normalize the stem
+    // only: underscores belong only right before the date.
     let (raw_stem, raw_date) = match split_date_suffix(&name) {
         Some((stem, d, m, y)) => (stem.to_string(), Some((d, m, y))),
         None => (name.clone(), None),
     };
-    let stem: String = raw_stem
+    let stem: String = de_shout(&raw_stem)
         .replace('_', " ")
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -525,9 +526,22 @@ fn valid_ymd(day: u32, mon: u32, year: i32) -> bool {
     (1..=31).contains(&day) && (1..=12).contains(&mon) && (1900..=2100).contains(&year)
 }
 
+fn normalize_year(y: i32) -> i32 {
+    // 2-digit years: 00-29 -> 2000s, 30-99 -> 1900s.
+    if y < 100 {
+        if y < 30 {
+            2000 + y
+        } else {
+            1900 + y
+        }
+    } else {
+        y
+    }
+}
+
 /// Parse a trailing date suffix in common formats. Returns (stem, day, month, year).
-/// Handles _DD-Mon-YYYY (e.g. _13-Oct-2025), _YYYY-MM-DD (e.g. _2025-10-13),
-/// and _MM-DD-YYYY (e.g. _10-13-2025).
+/// Handles _DD-Mon-YYYY (e.g. _13-Oct-2025), _DD-Mon-YY (e.g. _28-Aug-20),
+/// _YYYY-MM-DD (e.g. _2025-10-13), and _MM-DD-YYYY (e.g. _10-13-2025).
 fn split_date_suffix(s: &str) -> Option<(&str, u32, u32, i32)> {
     let i = s.rfind('_')?;
     let (stem, tail) = (&s[..i], &s[i + 1..]);
@@ -535,7 +549,7 @@ fn split_date_suffix(s: &str) -> Option<(&str, u32, u32, i32)> {
     match parts.as_slice() {
         [d, m, y] if m.chars().any(|c| c.is_alphabetic()) => {
             let day: u32 = d.parse().ok()?;
-            let year: i32 = y.parse().ok()?;
+            let year: i32 = normalize_year(y.parse().ok()?);
             let mon = MONTHS_ABBR.iter().position(|x| x.eq_ignore_ascii_case(m))? as u32 + 1;
             valid_ymd(day, mon, year).then_some((stem, day, mon, year))
         }
@@ -581,9 +595,11 @@ fn date_in_content(content: &str, day: u32, mon: u32, year: i32) -> bool {
     let lower = content.to_lowercase();
     let abbr = MONTHS_ABBR[(mon - 1) as usize];
     let full = MONTHS_FULL[(mon - 1) as usize];
+    let yy = (year % 100) as u32;
     let cands = [
         format!("{day:02}-{abbr}-{year}"),
         format!("{day}-{abbr}-{year}"),
+        format!("{day:02}-{abbr}-{yy:02}"),
         format!("{abbr} {day}, {year}"),
         format!("{abbr} {day} {year}"),
         format!("{full} {day}, {year}"),
@@ -592,6 +608,8 @@ fn date_in_content(content: &str, day: u32, mon: u32, year: i32) -> bool {
         format!("{mon}/{day}/{year}"),
         format!("{day:02}/{mon:02}/{year}"),
         format!("{mon:02}/{day:02}/{year}"),
+        format!("{mon:02}/{day:02}/{yy:02}"),
+        format!("{day:02}/{mon:02}/{yy:02}"),
         format!("{year}/{mon:02}/{day:02}"),
         format!("{year}/{mon}/{day}"),
         format!("{year}-{mon:02}-{day:02}"),
