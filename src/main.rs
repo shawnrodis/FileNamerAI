@@ -180,59 +180,93 @@ fn best_datetime(path: &Path, is_video: bool) -> (chrono::NaiveDateTime, &'stati
         })
 }
 
-/// Embedded creation time from an MP4/MOV/M4V/3GP (moov/mvhd box).
+/// Iterate MP4 boxes: returns (type, content_start, next_pos).
+/// Handles 32-bit sizes, 64-bit largesize (size == 1), and size == 0 (to EOF).
+fn next_box(data: &[u8], pos: usize) -> Option<([u8; 4], usize, usize)> {
+    if pos + 8 > data.len() {
+        return None;
+    }
+    let mut size = u32::from_be_bytes(data[pos..pos + 4].try_into().ok()?) as u64;
+    let typ: [u8; 4] = data[pos + 4..pos + 8].try_into().ok()?;
+    let mut header = 8usize;
+    if size == 1 {
+        if pos + 16 > data.len() {
+            return None;
+        }
+        size = u64::from_be_bytes(data[pos + 8..pos + 16].try_into().ok()?);
+        header = 16;
+    } else if size == 0 {
+        size = (data.len() - pos) as u64;
+    }
+    if size < header as u64 {
+        return None;
+    }
+    let next = pos.checked_add(size as usize)?;
+    if next > data.len() {
+        return None;
+    }
+    Some((typ, pos + header, next))
+}
+
+fn find_box_content<'a>(data: &'a [u8], want: &[u8; 4]) -> Option<&'a [u8]> {
+    let mut pos = 0;
+    while let Some((typ, content_start, next_pos)) = next_box(data, pos) {
+        if &typ == want {
+            return Some(&data[content_start..next_pos]);
+        }
+        pos = next_pos;
+    }
+    None
+}
+
+/// Creation time from an mvhd or mdhd box (same FullBox layout).
 /// QuickTime epoch is 1904-01-01; a zero value means "not set".
-fn mp4_creation_datetime(path: &Path) -> Option<chrono::NaiveDateTime> {
+fn parse_box_time(body: &[u8]) -> Option<chrono::NaiveDateTime> {
     const QT_TO_UNIX: i64 = 2_082_844_800; // seconds between 1904-01-01 and 1970-01-01
-    let data = std::fs::read(path).ok()?;
-    let mut pos = 0usize;
-    // find the 'moov' top-level box
-    let moov: &[u8] = loop {
-        if pos + 8 > data.len() {
+    if body.len() < 4 {
+        return None;
+    }
+    let creation: u64 = if body[0] == 1 {
+        if body.len() < 12 {
             return None;
         }
-        let size = u32::from_be_bytes(data[pos..pos + 4].try_into().ok()?) as usize;
-        if size < 8 || pos + size > data.len() {
+        u64::from_be_bytes(body[4..12].try_into().ok()?)
+    } else {
+        if body.len() < 8 {
             return None;
         }
-        if &data[pos + 4..pos + 8] == b"moov" {
-            break &data[pos + 8..pos + size];
-        }
-        if size == 0 {
-            return None;
-        }
-        pos += size;
+        u32::from_be_bytes(body[4..8].try_into().ok()?) as u64
     };
-    // find 'mvhd' inside moov
-    let mut pos = 0usize;
-    while pos + 8 <= moov.len() {
-        let size = u32::from_be_bytes(moov[pos..pos + 4].try_into().ok()?) as usize;
-        if size < 8 || pos + size > moov.len() {
-            return None;
+    if creation == 0 {
+        return None;
+    }
+    chrono::DateTime::from_timestamp(creation as i64 - QT_TO_UNIX, 0).map(|dt| dt.naive_local())
+}
+
+/// Embedded creation time from an MP4/MOV/M4V/3GP: moov/mvhd first,
+/// then moov/trak/mdia/mdhd as fallback.
+fn mp4_creation_datetime(path: &Path) -> Option<chrono::NaiveDateTime> {
+    let data = std::fs::read(path).ok()?;
+    let moov = find_box_content(&data, b"moov")?;
+    if let Some(mvhd) = find_box_content(moov, b"mvhd") {
+        if let Some(dt) = parse_box_time(mvhd) {
+            return Some(dt);
         }
-        if &moov[pos + 4..pos + 8] == b"mvhd" {
-            let body = &moov[pos + 8..pos + size];
-            if body.is_empty() {
-                return None;
-            }
-            let creation: u64 = if body[0] == 1 {
-                if body.len() < 12 {
-                    return None;
+    }
+    let mut pos = 0;
+    while let Some((typ, cs, next)) = next_box(moov, pos) {
+        if &typ == b"trak" {
+            let trak = &moov[cs..next];
+            if let Some(mdia) = find_box_content(trak, b"mdia") {
+                if let Some(mdhd) = find_box_content(mdia, b"mdhd") {
+                    if let Some(dt) = parse_box_time(mdhd) {
+                        return Some(dt);
+                    }
                 }
-                u64::from_be_bytes(body[4..12].try_into().ok()?)
-            } else {
-                if body.len() < 8 {
-                    return None;
-                }
-                u32::from_be_bytes(body[4..8].try_into().ok()?) as u64
-            };
-            if creation == 0 {
-                return None;
             }
-            return chrono::DateTime::from_timestamp(creation as i64 - QT_TO_UNIX, 0)
-                .map(|dt| dt.naive_local());
+            break; // first track is enough
         }
-        pos += size;
+        pos = next;
     }
     None
 }
