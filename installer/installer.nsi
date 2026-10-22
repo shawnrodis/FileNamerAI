@@ -48,6 +48,7 @@ Section "File Namer AI" SecApp
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\FileNamerAI" "URLInfoAbout" "${APP_URL}"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\FileNamerAI" "UninstallString" "$\"$INSTDIR\Uninstall.exe$\""
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\FileNamerAI" "DisplayIcon" "$INSTDIR\FileNamerAI.exe"
+  WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\FileNamerAI" "EstimatedSize" 19368
 
   ; Start Menu shortcuts (per-user).
   CreateDirectory "$SMPROGRAMS\File Namer AI"
