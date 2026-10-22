@@ -18,6 +18,7 @@ ShowInstDetails show
 !define MUI_ABORTWARNING
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_DIRECTORY
+!insertmacro MUI_PAGE_COMPONENTS
 !insertmacro MUI_PAGE_INSTFILES
 !define MUI_FINISHPAGE_RUN "$INSTDIR\FileNamerAI.exe"
 !define MUI_FINISHPAGE_RUN_TEXT "Launch File Namer AI"
@@ -26,7 +27,8 @@ ShowInstDetails show
 !insertmacro MUI_UNPAGE_INSTFILES
 !insertmacro MUI_LANGUAGE "English"
 
-Section "Install"
+Section "File Namer AI" SecApp
+  SectionIn RO  ; required — cannot be unchecked
   SetOutPath "$INSTDIR"
   File "FileNamerAI.exe"
   WriteUninstaller "$INSTDIR\Uninstall.exe"
@@ -53,6 +55,15 @@ Section "Install"
   CreateShortcut "$SMPROGRAMS\File Namer AI\Uninstall.lnk" "$INSTDIR\Uninstall.exe"
 SectionEnd
 
+Section "Desktop Icon" SecDesktop
+  CreateShortcut "$DESKTOP\File Namer AI.lnk" "$INSTDIR\FileNamerAI.exe"
+SectionEnd
+
+!insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
+  !insertmacro MUI_DESCRIPTION_TEXT ${SecApp} "Installs the application, registers the right-click context menu, and adds Start Menu shortcuts."
+  !insertmacro MUI_DESCRIPTION_TEXT ${SecDesktop} "Adds a File Namer AI icon to your desktop."
+!insertmacro MUI_FUNCTION_DESCRIPTION_END
+
 Section "Uninstall"
   Delete "$INSTDIR\FileNamerAI.exe"
   Delete "$INSTDIR\Uninstall.exe"
@@ -64,4 +75,6 @@ Section "Uninstall"
   Delete "$SMPROGRAMS\File Namer AI\File Namer AI.lnk"
   Delete "$SMPROGRAMS\File Namer AI\Uninstall.lnk"
   RMDir "$SMPROGRAMS\File Namer AI"
+
+  Delete "$DESKTOP\File Namer AI.lnk"
 SectionEnd
