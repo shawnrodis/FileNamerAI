@@ -292,7 +292,9 @@ fn ask_ollama(cfg: &Config, path: &Path, content: &str) -> Result<String, String
         .send()
         .map_err(|e| format!("Ollama request failed: {e}"))?;
     if !resp.status().is_success() {
-        return Err(format!("Ollama returned HTTP {}", resp.status()));
+        let status = resp.status();
+        let body: String = resp.text().unwrap_or_default().chars().take(200).collect();
+        return Err(format!("Ollama returned HTTP {status}: {body}"));
     }
     let v: serde_json::Value = resp.json().map_err(|e| format!("Bad response from Ollama: {e}"))?;
     let text = v["message"]["content"].as_str().unwrap_or("").trim();
