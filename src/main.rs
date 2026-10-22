@@ -153,10 +153,23 @@ fn exif_datetime(path: &Path) -> Option<chrono::NaiveDateTime> {
 /// at or after capture, so the earliest date is closest to the original.
 fn best_datetime(path: &Path, is_video: bool) -> (chrono::NaiveDateTime, &'static str) {
     let mut cands: Vec<(chrono::NaiveDateTime, &'static str)> = Vec::new();
-    // Videos imitate BRU: minute precision (:00 seconds) on every source,
-    // applied before comparison so priority order is preserved.
+    // Truncation rule (per Shawn 2026-10-22, BRU parity):
+    // - Videos: always truncate to :00 (BRU Item Date).
+    // - Photos with real EXIF: keep full seconds (BRU Date Taken).
+    // - Photos without EXIF (screenshots, Messenger downloads): truncate to :00.
+    // Applied before comparison so priority order is preserved.
+    let mut has_exif = false;
+    if is_video {
+        if let Some(dt) = mp4_creation_datetime(path) {
+            cands.push((dt, "video media date"));
+        }
+    } else if let Some(dt) = exif_datetime(path) {
+        has_exif = true;
+        cands.push((dt, "EXIF date taken"));
+    }
+    let truncate = is_video || !has_exif;
     let trunc = |dt: chrono::NaiveDateTime| -> chrono::NaiveDateTime {
-        if is_video {
+        if truncate {
             dt.with_second(0)
                 .and_then(|d| d.with_nanosecond(0))
                 .unwrap_or(dt)
@@ -164,12 +177,8 @@ fn best_datetime(path: &Path, is_video: bool) -> (chrono::NaiveDateTime, &'stati
             dt
         }
     };
-    if is_video {
-        if let Some(dt) = mp4_creation_datetime(path) {
-            cands.push((trunc(dt), "video media date"));
-        }
-    } else if let Some(dt) = exif_datetime(path) {
-        cands.push((dt, "EXIF date taken"));
+    for (dt, _) in cands.iter_mut() {
+        *dt = trunc(*dt);
     }
     if let Ok(md) = std::fs::metadata(path) {
         if let Ok(st) = md.created() {
