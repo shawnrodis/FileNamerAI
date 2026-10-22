@@ -1,5 +1,9 @@
 # File Namer AI
 
+<p align="center">
+  <img src="assets/icon.png" alt="FileNamerAI app icon" width="120">
+</p>
+
 Right-click any file → **"Rename with File Namer AI"**. **Photos and videos**
 are renamed deterministically from their metadata — no AI needed — using
 BRU-style date names (`MM-DD-YY-HH-MM-SS`). **Documents** get a descriptive
