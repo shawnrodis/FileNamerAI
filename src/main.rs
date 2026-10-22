@@ -153,9 +153,20 @@ fn exif_datetime(path: &Path) -> Option<chrono::NaiveDateTime> {
 /// at or after capture, so the earliest date is closest to the original.
 fn best_datetime(path: &Path, is_video: bool) -> (chrono::NaiveDateTime, &'static str) {
     let mut cands: Vec<(chrono::NaiveDateTime, &'static str)> = Vec::new();
+    // Videos imitate BRU: minute precision (:00 seconds) on every source,
+    // applied before comparison so priority order is preserved.
+    let trunc = |dt: chrono::NaiveDateTime| -> chrono::NaiveDateTime {
+        if is_video {
+            dt.with_second(0)
+                .and_then(|d| d.with_nanosecond(0))
+                .unwrap_or(dt)
+        } else {
+            dt
+        }
+    };
     if is_video {
         if let Some(dt) = mp4_creation_datetime(path) {
-            cands.push((dt, "video media date"));
+            cands.push((trunc(dt), "video media date"));
         }
     } else if let Some(dt) = exif_datetime(path) {
         cands.push((dt, "EXIF date taken"));
@@ -163,11 +174,11 @@ fn best_datetime(path: &Path, is_video: bool) -> (chrono::NaiveDateTime, &'stati
     if let Ok(md) = std::fs::metadata(path) {
         if let Ok(st) = md.created() {
             let dt: chrono::DateTime<chrono::Local> = st.into();
-            cands.push((dt.naive_local(), "file created date"));
+            cands.push((trunc(dt.naive_local()), "file created date"));
         }
         if let Ok(st) = md.modified() {
             let dt: chrono::DateTime<chrono::Local> = st.into();
-            cands.push((dt.naive_local(), "file modified date"));
+            cands.push((trunc(dt.naive_local()), "file modified date"));
         }
     }
     cands
@@ -249,16 +260,7 @@ fn parse_box_time(body: &[u8]) -> Option<chrono::NaiveDateTime> {
 
 /// Embedded creation time from an MP4/MOV/M4V/3GP: moov/mvhd first,
 /// then moov/trak/mdia/mdhd as fallback.
-///
-/// Matches Bulk Rename Utility: video timestamps are minute-precision,
-/// so seconds are truncated to :00.
 fn mp4_creation_datetime(path: &Path) -> Option<chrono::NaiveDateTime> {
-    let dt = mp4_creation_datetime_raw(path)?;
-    dt.with_second(0)?.with_nanosecond(0)
-}
-
-/// Raw embedded creation time (full precision).
-fn mp4_creation_datetime_raw(path: &Path) -> Option<chrono::NaiveDateTime> {
     let data = std::fs::read(path).ok()?;
     let moov = find_box_content(&data, b"moov")?;
     if let Some(mvhd) = find_box_content(moov, b"mvhd") {
