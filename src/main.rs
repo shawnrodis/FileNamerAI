@@ -511,10 +511,28 @@ fn install_menu() -> Result<(), String> {
     let exe_s = exe.to_string_lossy();
     run_reg(&["add", MENU_KEY, "/ve", "/d", "Rename with File Namer AI", "/f"])?;
     run_reg(&["add", MENU_KEY, "/v", "Icon", "/d", &exe_s, "/f"])?;
+    // "Document" = one invocation with every selected file, so multi-select
+    // opens a single batch window instead of one window per file.
+    run_reg(&[
+        "add", MENU_KEY, "/v", "MultiSelectModel", "/d", "Document", "/f",
+    ])?;
     let cmd_key = format!("{MENU_KEY}\\command");
     let cmd = format!("\"{exe_s}\" \"%1\"");
     run_reg(&["add", &cmd_key, "/ve", "/d", &cmd, "/f"])?;
     Ok(())
+}
+
+/// Existing installs predate MultiSelectModel: add it silently on launch.
+fn ensure_multiselect() {
+    if !menu_installed() {
+        return;
+    }
+    let out = run_reg(&["query", MENU_KEY, "/v", "MultiSelectModel"]);
+    if out.is_err() {
+        let _ = run_reg(&[
+            "add", MENU_KEY, "/v", "MultiSelectModel", "/d", "Document", "/f",
+        ]);
+    }
 }
 
 fn uninstall_menu() -> Result<(), String> {
@@ -747,8 +765,8 @@ fn strip_partial_date(s: &str) -> Option<&str> {
     }
 }
 
-/// If "stem.ext" already exists next to the file, return "stem-02",
-/// "stem-03", ... (burst shots share a timestamp). The file's own current
+/// If "stem.ext" already exists next to the file, return "stem_1",
+/// "stem_2", ... (BRU-style: collisions get _1, _2). The file's own current
 /// name is never treated as a collision.
 fn unique_stem(path: &Path, stem: &str, ext: &str) -> String {
     let name_for = |s: &str| {
@@ -765,8 +783,8 @@ fn unique_stem(path: &Path, stem: &str, ext: &str) -> String {
     if ok(stem) {
         return stem.to_string();
     }
-    for n in 2..100 {
-        let s = format!("{stem}-{n:02}");
+    for n in 1..1000 {
+        let s = format!("{stem}_{n}");
         if ok(&s) {
             return s;
         }
@@ -852,8 +870,187 @@ fn rename_worker(path: PathBuf, cfg: Config, tx: mpsc::Sender<WorkerMsg>, attemp
     }
 }
 
+// ---------------------------------------------------------------------------
+// batch mode (multi-select): one window, BRU-style _1/_2 collision assessment
+// ---------------------------------------------------------------------------
+
+struct BatchProposal {
+    stem: String,
+    date_source: Option<String>, // Some for photos/videos, None for documents
+}
+
+enum BatchMsg {
+    Proposal(usize, Result<BatchProposal, String>),
+}
+
+fn batch_worker(idx: usize, path: PathBuf, cfg: Config, tx: mpsc::Sender<BatchMsg>) {
+    let result: Result<BatchProposal, String> = (|| {
+        match extract_content(&path)? {
+            Extracted::DateTime(dt, src) => Ok(BatchProposal {
+                stem: sanitize_filename(&dt.format("%m-%d-%y-%H-%M-%S").to_string()),
+                date_source: Some(src.to_string()),
+            }),
+            Extracted::Text(content) => {
+                if !ollama_up(&cfg.ollama_url) {
+                    return Err("Ollama isn't running. Start it, then reopen this window.".into());
+                }
+                let name = ask_ollama(&cfg, &path, &content, 0)?;
+                Ok(BatchProposal {
+                    stem: sanitize_filename(&name),
+                    date_source: None,
+                })
+            }
+        }
+    })();
+    let _ = tx.send(BatchMsg::Proposal(idx, result));
+}
+
+struct BatchRow {
+    path: PathBuf,
+    current_name: String,
+    ext: String,
+    edit_buf: String, // proposed stem, editable
+    manual: bool,     // user edited it; worker must not overwrite
+    ready: bool,      // worker delivered (or manual text entered)
+    date_source: Option<String>,
+    error: Option<String>,
+    renamed_to: Option<String>, // set after Rename All
+}
+
+#[derive(Clone)]
+enum RowStatus {
+    Working,
+    Error,
+    NoOp,
+    Ready { final_name: String, suffixed: bool },
+}
+
+/// BRU-style batch collision resolution: every file that would share a name
+/// (with another selected file or an existing disk file) gets _1, _2, ...
+/// Files already correctly named are left alone and hold their names.
+fn resolve_batch(rows: &[BatchRow]) -> Vec<RowStatus> {
+    use std::collections::{HashMap, HashSet};
+
+    let mut out: Vec<RowStatus> = vec![RowStatus::Working; rows.len()];
+
+    // Effective (sanitized) stems; None = not ready or error/empty.
+    let eff: Vec<Option<String>> = rows
+        .iter()
+        .map(|r| {
+            if r.error.is_some() || !r.ready {
+                None
+            } else {
+                let s = sanitize_filename(&r.edit_buf);
+                if s.is_empty() { None } else { Some(s) }
+            }
+        })
+        .collect();
+    for (i, r) in rows.iter().enumerate() {
+        if r.error.is_some() {
+            out[i] = RowStatus::Error;
+        }
+    }
+
+    // Work per parent directory (multi-select can span folders).
+    let mut by_dir: HashMap<PathBuf, Vec<usize>> = HashMap::new();
+    for (i, r) in rows.iter().enumerate() {
+        if eff[i].is_none() {
+            continue;
+        }
+        let dir = r
+            .path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_default();
+        by_dir.entry(dir).or_default().push(i);
+    }
+
+    for (dir, indices) in by_dir {
+        // Names taken on disk; files we're renaming vacate theirs.
+        let mut taken: HashSet<String> = HashSet::new();
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                if let Some(n) = e.file_name().to_str() {
+                    taken.insert(n.to_lowercase());
+                }
+            }
+        }
+        // No-op detection first (case-insensitive; Windows is too).
+        let mut is_noop = HashMap::new();
+        for &i in &indices {
+            let r = &rows[i];
+            let s = eff[i].as_ref().unwrap();
+            let full = if r.ext.is_empty() {
+                s.clone()
+            } else {
+                format!("{s}.{}", r.ext)
+            };
+            let noop = full.to_lowercase() == r.current_name.to_lowercase();
+            is_noop.insert(i, noop);
+            if noop {
+                out[i] = RowStatus::NoOp;
+            } else {
+                taken.remove(&r.current_name.to_lowercase());
+            }
+        }
+        // Group the rest by (stem, ext).
+        let mut groups: HashMap<(String, String), Vec<usize>> = HashMap::new();
+        for &i in &indices {
+            if is_noop[&i] {
+                continue;
+            }
+            let r = &rows[i];
+            groups
+                .entry((eff[i].as_ref().unwrap().clone(), r.ext.clone()))
+                .or_default()
+                .push(i);
+        }
+        let mut keys: Vec<(String, String)> = groups.keys().cloned().collect();
+        keys.sort();
+        for (stem, ext) in keys {
+            let mut members = groups[&(stem.clone(), ext.clone())].clone();
+            members.sort_by(|&a, &b| rows[a].current_name.cmp(&rows[b].current_name));
+            let full = |s: &str| {
+                if ext.is_empty() {
+                    s.to_string()
+                } else {
+                    format!("{s}.{ext}")
+                }
+            };
+            if members.len() == 1 && !taken.contains(&full(&stem).to_lowercase()) {
+                taken.insert(full(&stem).to_lowercase());
+                out[members[0]] = RowStatus::Ready {
+                    final_name: full(&stem),
+                    suffixed: false,
+                };
+            } else {
+                let mut n = 1u32;
+                for &idx in &members {
+                    loop {
+                        let cand = format!("{stem}_{n}");
+                        if n > 9999 {
+                            break;
+                        }
+                        if !taken.contains(&full(&cand).to_lowercase()) {
+                            taken.insert(full(&cand).to_lowercase());
+                            out[idx] = RowStatus::Ready {
+                                final_name: full(&cand),
+                                suffixed: true,
+                            };
+                            n += 1;
+                            break;
+                        }
+                        n += 1;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 impl NamerApp {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, files: Vec<PathBuf>) -> Self {
         cc.egui_ctx.set_visuals(if is_dark_mode() {
             egui::Visuals::dark()
         } else {
@@ -861,12 +1058,7 @@ impl NamerApp {
         });
 
         let cfg = load_config();
-        let args: Vec<String> = std::env::args().skip(1).collect();
-        let file_path = args
-            .iter()
-            .find(|a| !a.starts_with('-'))
-            .map(PathBuf::from)
-            .filter(|p| p.is_file());
+        let file_path = files.into_iter().next();
 
         let mut app = Self {
             is_rename_mode: file_path.is_some(),
@@ -1265,10 +1457,279 @@ impl eframe::App for NamerApp {
     }
 }
 
+struct BatchApp {
+    rows: Vec<BatchRow>,
+    rx: mpsc::Receiver<BatchMsg>,
+    statuses: Vec<RowStatus>,
+    finished: bool,
+}
+
+impl BatchApp {
+    fn new(cc: &eframe::CreationContext<'_>, files: Vec<PathBuf>) -> Self {
+        cc.egui_ctx.set_visuals(if is_dark_mode() {
+            egui::Visuals::dark()
+        } else {
+            egui::Visuals::light()
+        });
+        let cfg = load_config();
+        let mut rows: Vec<BatchRow> = files
+            .into_iter()
+            .map(|path| {
+                let current_name = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                let ext = path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                BatchRow {
+                    path,
+                    current_name,
+                    ext,
+                    edit_buf: String::new(),
+                    manual: false,
+                    ready: false,
+                    date_source: None,
+                    error: None,
+                    renamed_to: None,
+                }
+            })
+            .collect();
+        rows.sort_by(|a, b| a.current_name.cmp(&b.current_name));
+        let (tx, rx) = mpsc::channel();
+        for (i, row) in rows.iter().enumerate() {
+            let tx = tx.clone();
+            let path = row.path.clone();
+            let cfg = cfg.clone();
+            thread::spawn(move || batch_worker(i, path, cfg, tx));
+        }
+        let statuses = vec![RowStatus::Working; rows.len()];
+        Self {
+            rows,
+            rx,
+            statuses,
+            finished: false,
+        }
+    }
+
+    fn re_resolve(&mut self) {
+        self.statuses = resolve_batch(&self.rows);
+    }
+
+    fn poll_workers(&mut self, ctx: &egui::Context) {
+        let mut got = false;
+        while let Ok(BatchMsg::Proposal(idx, result)) = self.rx.try_recv() {
+            got = true;
+            if let Some(row) = self.rows.get_mut(idx) {
+                match result {
+                    Ok(p) => {
+                        if !row.manual {
+                            row.edit_buf = p.stem;
+                        }
+                        row.date_source = p.date_source;
+                        row.ready = true;
+                    }
+                    Err(e) => {
+                        row.error = Some(e);
+                    }
+                }
+            }
+        }
+        if got {
+            self.re_resolve();
+        } else if self
+            .statuses
+            .iter()
+            .any(|s| matches!(s, RowStatus::Working))
+        {
+            ctx.request_repaint();
+        }
+    }
+
+    fn do_rename_all(&mut self) {
+        for (row, status) in self.rows.iter_mut().zip(self.statuses.iter()) {
+            if let RowStatus::Ready { final_name, .. } = status {
+                let target = row.path.with_file_name(final_name);
+                match std::fs::rename(&row.path, &target) {
+                    Ok(()) => row.renamed_to = Some(final_name.clone()),
+                    Err(e) => row.error = Some(format!("Rename failed: {e}")),
+                }
+            }
+        }
+        self.finished = true;
+    }
+}
+
+impl eframe::App for BatchApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_workers(ctx);
+        let mut needs_resolve = false;
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading(format!("Batch rename — {} files", self.rows.len()));
+            ui.add_space(4.0);
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    egui::Grid::new("batch_grid")
+                        .striped(true)
+                        .spacing([10.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label(egui::RichText::new("File").strong());
+                            ui.label(egui::RichText::new("Proposed name").strong());
+                            ui.label(egui::RichText::new("Final name").strong());
+                            ui.label(egui::RichText::new("Source").strong());
+                            ui.end_row();
+                            for i in 0..self.rows.len() {
+                                ui.label(
+                                    egui::RichText::new(&self.rows[i].current_name).small(),
+                                );
+                                ui.horizontal(|ui| {
+                                    let resp = ui.add(
+                                        egui::TextEdit::singleline(&mut self.rows[i].edit_buf)
+                                            .desired_width(200.0),
+                                    );
+                                    if resp.changed() {
+                                        self.rows[i].manual = true;
+                                        self.rows[i].ready = true;
+                                        needs_resolve = true;
+                                    }
+                                    if !self.rows[i].ext.is_empty() {
+                                        ui.label(format!(".{}", self.rows[i].ext));
+                                    }
+                                });
+                                // Final-name column.
+                                match &self.statuses[i] {
+                                    RowStatus::Working => {
+                                        ui.label(egui::RichText::new("…").weak());
+                                    }
+                                    RowStatus::Error => {
+                                        ui.label(
+                                            egui::RichText::new("error")
+                                                .color(egui::Color32::RED),
+                                        );
+                                    }
+                                    RowStatus::NoOp => {
+                                        ui.label(
+                                            egui::RichText::new("already named").weak(),
+                                        );
+                                    }
+                                    RowStatus::Ready { final_name, suffixed } => {
+                                        if self.finished
+                                            && self.rows[i].renamed_to.is_some()
+                                        {
+                                            ui.label(
+                                                egui::RichText::new(format!("✓ {final_name}"))
+                                                    .color(egui::Color32::GREEN),
+                                            );
+                                        } else {
+                                            let mut t =
+                                                egui::RichText::new(final_name).small();
+                                            if *suffixed {
+                                                t = t.strong();
+                                            }
+                                            ui.label(t);
+                                        }
+                                    }
+                                }
+                                // Source / error column.
+                                if let Some(e) = &self.rows[i].error {
+                                    ui.label(
+                                        egui::RichText::new(e)
+                                            .color(egui::Color32::RED)
+                                            .small(),
+                                    );
+                                } else if let Some(s) = &self.rows[i].date_source {
+                                    ui.label(egui::RichText::new(s).small().weak());
+                                } else {
+                                    ui.label("");
+                                }
+                                ui.end_row();
+                            }
+                        });
+                });
+            ui.add_space(6.0);
+            ui.separator();
+            let to_rename = self
+                .statuses
+                .iter()
+                .filter(|s| matches!(s, RowStatus::Ready { .. }))
+                .count();
+            let noop = self
+                .statuses
+                .iter()
+                .filter(|s| matches!(s, RowStatus::NoOp))
+                .count();
+            let errs = self
+                .statuses
+                .iter()
+                .filter(|s| matches!(s, RowStatus::Error))
+                .count();
+            let working = self
+                .statuses
+                .iter()
+                .filter(|s| matches!(s, RowStatus::Working))
+                .count();
+            if !self.finished {
+                ui.label(format!(
+                    "{to_rename} to rename • {noop} already named • {errs} errors"
+                ));
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let can_go = to_rename > 0 && working == 0;
+                    if ui
+                        .add_enabled(can_go, egui::Button::new("Rename All"))
+                        .clicked()
+                    {
+                        self.do_rename_all();
+                    }
+                    if ui.button("Cancel").clicked() {
+                        std::process::exit(0);
+                    }
+                    if working > 0 {
+                        ui.label(format!("Working on {working}…"));
+                    }
+                });
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Tip: edit any proposed name — collisions are re-checked across all files.",
+                    )
+                    .small()
+                    .weak(),
+                );
+            } else {
+                let ok = self.rows.iter().filter(|r| r.renamed_to.is_some()).count();
+                let failed = self.rows.iter().filter(|r| r.error.is_some()).count();
+                ui.label(format!("Done: {ok} renamed • {failed} failed."));
+                ui.add_space(4.0);
+                if ui.button("Close").clicked() {
+                    std::process::exit(0);
+                }
+            }
+        });
+        if needs_resolve {
+            self.re_resolve();
+        }
+    }
+}
+
 fn main() {
+    // Registry migration for installs that predate multi-select support.
+    ensure_multiselect();
+
+    let files: Vec<PathBuf> = std::env::args()
+        .skip(1)
+        .filter(|a| !a.starts_with('-'))
+        .map(PathBuf::from)
+        .filter(|p| p.is_file())
+        .collect();
+    let batch = files.len() > 1;
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("File Namer AI")
-        .with_inner_size([600.0, 560.0]);
+        .with_inner_size(if batch { [760.0, 540.0] } else { [600.0, 560.0] });
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
         viewport = viewport.with_icon(std::sync::Arc::new(icon));
     }
@@ -1279,6 +1740,12 @@ fn main() {
     let _ = eframe::run_native(
         "File Namer AI",
         options,
-        Box::new(|cc| Box::new(NamerApp::new(cc))),
+        Box::new(move |cc| {
+            if batch {
+                Box::new(BatchApp::new(cc, files.clone())) as Box<dyn eframe::App>
+            } else {
+                Box::new(NamerApp::new(cc, files.clone())) as Box<dyn eframe::App>
+            }
+        }),
     );
 }
