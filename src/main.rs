@@ -280,7 +280,7 @@ fn build_prompt(original: &str, content: &str, append_date: bool) -> String {
          \n\
          Rules (follow exactly):\n\
          - Output ONLY the filename: no quotes, no explanation, no file extension.\n\
-         - Use spaces between words, e.g. Saw Palmetto Price Comparison.\n\
+         - Use spaces between words with normal Title Case (e.g. Saw Palmetto Price Comparison). Never ALL CAPS.\n\
          - Maximum 50 characters.\n\
          {date_rule}\
          \n\
@@ -357,20 +357,35 @@ fn ask_ollama(cfg: &Config, path: &Path, content: &str) -> Result<String, String
     if name.is_empty() {
         return Err("The model returned an empty name.".into());
     }
+    // No shouting: Title Case anything all-caps.
+    let mut name = de_shout(&name);
+    // A trailing bare year (_2026) or month-year (_Oct-2026) isn't a usable
+    // date — drop it so the best-effort fallback can supply the file's date.
+    if let Some(stem) = strip_partial_date(&name) {
+        name = stem.to_string();
+    }
+    // Split off any full trailing date, then normalize the stem: underscores
+    // are only allowed right before the date.
+    let (raw_stem, raw_date) = match split_date_suffix(&name) {
+        Some((stem, d, m, y)) => (stem.to_string(), Some((d, m, y))),
+        None => (name.clone(), None),
+    };
+    let stem: String = raw_stem
+        .replace('_', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     // Verify any date the model added: it must actually appear in the content.
     // If not — or if the user disabled dates entirely — strip it.
     // Otherwise normalize it to Shawn's format (28-Mar-2012).
     // Never ship an invented date.
-    let mut name = match split_date_suffix(&name) {
-        Some((stem, _, _, _)) if cfg.never_dates => stem.to_string(),
-        Some((stem, d, m, y)) => {
-            if date_in_content(content, d, m, y) {
-                format!("{stem}_{}", fmt_doc_date(d, m, y))
-            } else {
-                stem.to_string()
-            }
+    let mut name = match raw_date {
+        Some(_) if cfg.never_dates => stem,
+        Some((d, m, y)) if date_in_content(content, d, m, y) => {
+            format!("{stem}_{}", fmt_doc_date(d, m, y))
         }
-        _ => name,
+        Some(_) => stem,
+        None => stem,
     };
     // Best effort: if the name still has no date, fall back to the file's own
     // date (Created, else Modified) — unless dates are disabled entirely.
@@ -577,10 +592,54 @@ fn date_in_content(content: &str, day: u32, mon: u32, year: i32) -> bool {
         format!("{mon}/{day}/{year}"),
         format!("{day:02}/{mon:02}/{year}"),
         format!("{mon:02}/{day:02}/{year}"),
+        format!("{year}/{mon:02}/{day:02}"),
+        format!("{year}/{mon}/{day}"),
         format!("{year}-{mon:02}-{day:02}"),
+        format!("{year}.{mon:02}.{day:02}"),
         format!("{day:02}.{mon:02}.{year}"),
     ];
     cands.iter().any(|c| lower.contains(c.as_str()))
+}
+
+/// If the name is SHOUTING (all caps), convert to Title Case.
+fn de_shout(s: &str) -> String {
+    let has_lower = s.chars().any(|c| c.is_lowercase());
+    let has_upper = s.chars().any(|c| c.is_uppercase());
+    if !(has_upper && !has_lower) {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut cap_next = true;
+    for c in s.chars() {
+        if c == ' ' || c == '_' || c == '-' {
+            out.push(c);
+            cap_next = true;
+        } else if cap_next {
+            out.extend(c.to_uppercase());
+            cap_next = false;
+        } else {
+            out.extend(c.to_lowercase());
+        }
+    }
+    out
+}
+
+/// Trailing incomplete date: _YYYY or _Mon-YYYY. Returns the stem without it.
+fn strip_partial_date(s: &str) -> Option<&str> {
+    let i = s.rfind('_')?;
+    let (stem, tail) = (&s[..i], &s[i + 1..]);
+    let parts: Vec<&str> = tail.split('-').collect();
+    match parts.as_slice() {
+        [y] if y.len() == 4 && y.chars().all(|c| c.is_ascii_digit()) => Some(stem),
+        [m, y]
+            if y.len() == 4
+                && y.chars().all(|c| c.is_ascii_digit())
+                && MONTHS_ABBR.iter().any(|x| x.eq_ignore_ascii_case(m)) =>
+        {
+            Some(stem)
+        }
+        _ => None,
+    }
 }
 
 /// If "stem.ext" already exists next to the file, return "stem-02",
