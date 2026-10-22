@@ -1412,6 +1412,39 @@ impl NamerApp {
                 }
             }
             RenameState::Confirm => {
+                // Already-named detection (same logic as batch): the suggestion
+                // resolves to the file's current name (modulo a _N suffix).
+                let new_name = if self.file_ext.is_empty() {
+                    self.suggestion.clone()
+                } else {
+                    format!("{}.{}", self.suggestion, self.file_ext)
+                };
+                let already = self
+                    .file_path
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .and_then(|s| s.to_str())
+                    .map(|cur| cur.to_lowercase() == new_name.to_lowercase())
+                    .unwrap_or(false);
+                if already {
+                    ui.label(
+                        egui::RichText::new(format!("✓ Already correctly named as {new_name}"))
+                            .color(egui::Color32::GREEN)
+                            .strong(),
+                    );
+                    if let Some(src) = &self.date_source {
+                        ui.label(
+                            egui::RichText::new(format!("Date source: {src}"))
+                                .weak()
+                                .small(),
+                        );
+                    }
+                    ui.add_space(8.0);
+                    if ui.button("Close").clicked() {
+                        std::process::exit(0);
+                    }
+                    return;
+                }
                 ui.label("Proposed name (edit if you like):");
                 ui.horizontal(|ui| {
                     ui.add(
