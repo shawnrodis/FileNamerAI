@@ -126,6 +126,21 @@ fn parse_exif_dt(s: &str) -> Option<chrono::NaiveDateTime> {
     None
 }
 
+/// True if the file has a real DateTimeOriginal EXIF tag (0x9003).
+/// Other EXIF date tags (0x9004 Digitized, 0x0132 DateTime) don't count —
+/// they're often just modification stamps on downloads/screenshots.
+fn has_datetime_original(path: &Path) -> bool {
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut reader = BufReader::new(file);
+    match exif::Reader::new().read_from_container(&mut reader) {
+        Ok(exif) => exif.fields().any(|f| f.tag.number() == 0x9003),
+        Err(_) => false,
+    }
+}
+
 fn exif_datetime(path: &Path) -> Option<chrono::NaiveDateTime> {
     let file = std::fs::File::open(path).ok()?;
     let mut reader = BufReader::new(file);
@@ -158,16 +173,17 @@ fn best_datetime(path: &Path, is_video: bool) -> (chrono::NaiveDateTime, &'stati
     // - Photos with real EXIF: keep full seconds (BRU Date Taken).
     // - Photos without EXIF (screenshots, Messenger downloads): truncate to :00.
     // Applied before comparison so priority order is preserved.
-    let mut has_exif = false;
     if is_video {
         if let Some(dt) = mp4_creation_datetime(path) {
             cands.push((dt, "video media date"));
         }
     } else if let Some(dt) = exif_datetime(path) {
-        has_exif = true;
         cands.push((dt, "EXIF date taken"));
     }
-    let truncate = is_video || !has_exif;
+    // Only a real DateTimeOriginal (0x9003) exempts a photo from truncation.
+    // Generic EXIF date stamps (0x9004/0x0132) on downloads don't count.
+    let has_real_exif = !is_video && has_datetime_original(path);
+    let truncate = is_video || !has_real_exif;
     let trunc = |dt: chrono::NaiveDateTime| -> chrono::NaiveDateTime {
         if truncate {
             dt.with_second(0)
