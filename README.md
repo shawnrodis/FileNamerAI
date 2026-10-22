@@ -12,9 +12,11 @@ Single `.exe`, no installer, no console window. Runs as a normal user
 
 ## Download
 
-Grab the latest `FileNamerAI.exe` from
-[Releases](https://github.com/shawnrodis/FileNamerAI/releases) — no install
-needed, just run it. (Building from source is optional; instructions below.)
+Grab the latest `FileNamerAI-Setup-vX.Y.Z.exe` installer from
+[Releases](https://github.com/shawnrodis/FileNamerAI/releases) and run it —
+per-user install, no admin rights needed. It places the app in
+`%LOCALAPPDATA%\FileNamerAI`, registers the right-click menu, and adds an
+uninstaller. (Building from source is optional; instructions below.)
 
 ## How it works
 
