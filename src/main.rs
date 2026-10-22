@@ -113,41 +113,71 @@ enum Extracted {
     DateTime(chrono::NaiveDateTime, &'static str),
 }
 
+fn parse_exif_dt(s: &str) -> Option<chrono::NaiveDateTime> {
+    let s = s.trim().trim_matches('"').trim();
+    // display_value() may render datetimes with colons (2026:01:01 12:05:40)
+    // or dashes (2026-01-01 12:05:40) depending on the tag/writer.
+    for fmt in ["%Y:%m:%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"] {
+        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
+            return Some(dt);
+        }
+    }
+    None
+}
+
 fn exif_datetime(path: &Path) -> Option<chrono::NaiveDateTime> {
     let file = std::fs::File::open(path).ok()?;
     let mut reader = BufReader::new(file);
     let exif = exif::Reader::new().read_from_container(&mut reader).ok()?;
-    let field = exif
-        .get_field(exif::Tag::DateTimeOriginal, exif::In::PRIMARY)
-        .or_else(|| exif.get_field(exif::Tag::DateTime, exif::In::PRIMARY))?;
-    let s = field.display_value().to_string(); // "2026:10:22 15:26:11"
-    chrono::NaiveDateTime::parse_from_str(s.trim(), "%Y:%m:%d %H:%M:%S").ok()
+    // Match by tag NUMBER across every IFD: some writers store EXIF tags
+    // (e.g. DateTimeOriginal) as plain TIFF tags instead of in the EXIF IFD.
+    // 0x9003 = DateTimeOriginal, 0x9004 = DateTimeDigitized, 0x0132 = DateTime.
+    let mut cands: Vec<(u8, String)> = Vec::new();
+    for f in exif.fields() {
+        match f.tag.number() {
+            0x9003 => cands.push((0, f.display_value().to_string())),
+            0x9004 => cands.push((1, f.display_value().to_string())),
+            0x0132 => cands.push((2, f.display_value().to_string())),
+            _ => {}
+        }
+    }
+    cands.sort_by_key(|(prio, _)| *prio);
+    cands.into_iter().find_map(|(_, s)| parse_exif_dt(&s))
 }
 
 /// Best available timestamp: EXIF (photos) / embedded media date (videos),
 /// then file Created, then Modified, then now. Returns the source label too.
+///
+/// The EARLIEST timestamp wins: file operations (copy, rename, edit) happen
+/// at or after capture, so the earliest date is closest to the original.
 fn best_datetime(path: &Path, is_video: bool) -> (chrono::NaiveDateTime, &'static str) {
+    let mut cands: Vec<(chrono::NaiveDateTime, &'static str)> = Vec::new();
     if is_video {
         if let Some(dt) = mp4_creation_datetime(path) {
-            return (dt, "video media date");
+            cands.push((dt, "video media date"));
         }
     } else if let Some(dt) = exif_datetime(path) {
-        return (dt, "EXIF date taken");
+        cands.push((dt, "EXIF date taken"));
     }
     if let Ok(md) = std::fs::metadata(path) {
         if let Ok(st) = md.created() {
             let dt: chrono::DateTime<chrono::Local> = st.into();
-            return (dt.naive_local(), "file created date");
+            cands.push((dt.naive_local(), "file created date"));
         }
         if let Ok(st) = md.modified() {
             let dt: chrono::DateTime<chrono::Local> = st.into();
-            return (dt.naive_local(), "file modified date");
+            cands.push((dt.naive_local(), "file modified date"));
         }
     }
-    (
-        chrono::Local::now().naive_local(),
-        "current time (no date found)",
-    )
+    cands
+        .into_iter()
+        .min_by_key(|(dt, _)| *dt)
+        .unwrap_or_else(|| {
+            (
+                chrono::Local::now().naive_local(),
+                "current time (no date found)",
+            )
+        })
 }
 
 /// Embedded creation time from an MP4/MOV/M4V/3GP (moov/mvhd box).
