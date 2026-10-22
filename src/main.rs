@@ -3,6 +3,7 @@
 //! File Namer AI - right-click AI file renaming powered by a local LLM (Ollama).
 
 use eframe::egui;
+use chrono::Datelike;
 use std::io::BufReader;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -360,7 +361,7 @@ fn ask_ollama(cfg: &Config, path: &Path, content: &str) -> Result<String, String
     // If not — or if the user disabled dates entirely — strip it.
     // Otherwise normalize it to Shawn's format (28-Mar-2012).
     // Never ship an invented date.
-    let name = match split_date_suffix(&name) {
+    let mut name = match split_date_suffix(&name) {
         Some((stem, _, _, _)) if cfg.never_dates => stem.to_string(),
         Some((stem, d, m, y)) => {
             if date_in_content(content, d, m, y) {
@@ -371,6 +372,13 @@ fn ask_ollama(cfg: &Config, path: &Path, content: &str) -> Result<String, String
         }
         _ => name,
     };
+    // Best effort: if the name still has no date, fall back to the file's own
+    // date (Created, else Modified) — unless dates are disabled entirely.
+    if cfg.append_date && !cfg.never_dates && split_date_suffix(&name).is_none() {
+        if let Some((d, m, y)) = file_ymd(path) {
+            name = format!("{name}_{}", fmt_doc_date(d, m, y));
+        }
+    }
     Ok(name)
 }
 
@@ -529,6 +537,15 @@ fn split_date_suffix(s: &str) -> Option<(&str, u32, u32, i32)> {
         }
         _ => None,
     }
+}
+
+/// File's own date (Created, else Modified) as (day, month, year).
+fn file_ymd(path: &Path) -> Option<(u32, u32, i32)> {
+    let md = std::fs::metadata(path).ok()?;
+    let st = md.created().or_else(|_| md.modified()).ok()?;
+    let dt: chrono::DateTime<chrono::Local> = st.into();
+    let d = dt.naive_local();
+    Some((d.day(), d.month(), d.year()))
 }
 
 /// Format a date the way Shawn wants it: 28-Mar-2012.
