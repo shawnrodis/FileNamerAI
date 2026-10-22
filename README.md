@@ -1,8 +1,10 @@
 # File Namer AI
 
-Right-click any file → **"Rename with File Namer AI"** — and a local AI
-proposes a better filename based on the file's contents, with a date appended
-when the content has one. 100% local: no cloud, no API keys, no subscriptions.
+Right-click any file → **"Rename with File Namer AI"**. **Photos and videos**
+are renamed deterministically from their metadata — no AI needed — using
+BRU-style date names (`MM-DD-YY-HH-MM-SS`). **Documents** get a descriptive
+name proposed by a local AI (Ollama). 100% local: no cloud, no API keys,
+no subscriptions.
 
 Built with [Rust](https://www.rust-lang.org/) and [egui](https://www.egui.rs/).
 Single `.exe`, no installer, no console window. Runs as a normal user
@@ -18,25 +20,34 @@ needed, just run it. (Building from source is optional; instructions below.)
 
 1. Run the app once and click **"Add to right-click menu"** (writes a
    per-user registry entry — no admin needed).
-2. Install [Ollama](https://ollama.com), then `ollama pull qwen2.5:3b`
-   (a ~2GB download, one time).
-3. Right-click any file → "Rename with File Namer AI".
-4. The app extracts the file's text, asks your local model for a concise
-   descriptive name, and shows a confirm dialog — edit the name if you like,
-   then Rename.
+2. For documents: install [Ollama](https://ollama.com), then
+   `ollama pull qwen2.5:3b` (a ~2GB download, one time). Not needed for
+   photos/videos.
+3. Right-click any file → "Rename with File Namer AI" (select several files
+   to rename them all in one batch window).
+4. A confirm dialog shows the proposed name — edit it if you like, then Rename.
+   Files that are already correctly named are detected and skipped.
 
 Supported files:
 - **Documents** (PDF, TXT/MD/CSV/LOG/JSON/XML/HTML): the local AI reads the
-  content and proposes a descriptive name, with a date appended when the
-  content has one.
-- **Photos** (JPG/PNG/TIF/WebP/HEIC…): renamed by **EXIF Date Taken**, no AI
-  needed — e.g. `01-10-26-20-10-12.jpg`. Falls back to file dates when there's
-  no EXIF data.
+  content and proposes a descriptive Title Case name, with the date appended
+  as `DD-Mon-YYYY` (e.g. `Saw Palmetto Price Comparison_28-May-2023`) when the
+  content has a verifiable date. Dates the AI invents are stripped; if no date
+  is found, the file's own date is used. A "Never add dates" option disables
+  dates entirely.
+- **Photos** (JPG/PNG/TIF/WebP/HEIC…): renamed by **EXIF Date Taken** with full
+  seconds — e.g. `01-10-26-20-10-12.jpg`. Photos *without* real EXIF data
+  (screenshots, Messenger downloads) fall back to file dates truncated to the
+  minute, e.g. `01-11-26-08-48-00.jpg` — matching Bulk Rename Utility's
+  "Item Date" behavior. No AI involved.
 - **Videos** (MP4/MOV/M4V/3GP/AVI/MKV/WebM): renamed by the video's embedded
-  media-created date, else file dates — same `MM-DD-YY-HH-MM-SS` format, no AI.
+  media-created date (converted to local time), else file dates — always
+  truncated to the minute (`:00` seconds), e.g. `01-01-26-15-07-00.mp4`.
+  No AI involved.
 
-Name collisions (burst shots sharing a timestamp) get `-02`, `-03` suffixes
-automatically.
+Name collisions (burst shots sharing a timestamp) get BRU-style `_1`, `_2`
+suffixes automatically. The earliest timestamp wins when sources disagree,
+since file operations happen at or after capture.
 
 Note: on Windows 11 the menu item lives under "Show more options".
 
