@@ -342,8 +342,12 @@ fn ask_ollama(cfg: &Config, path: &Path, content: &str) -> Result<String, String
     if name.is_empty() {
         return Err("The model returned an empty name.".into());
     }
-    // Never invent a date: if the model didn't find one in the content,
-    // the name stays dateless.
+    // Verify any date the model added: it must actually appear in the content.
+    // If not, strip it — never ship an invented date.
+    let name = match split_date_suffix(&name) {
+        Some((stem, d, m, y)) if !date_in_content(content, d, m, y) => stem.to_string(),
+        _ => name,
+    };
     Ok(name)
 }
 
@@ -450,6 +454,58 @@ fn open_url(url: &str) {
         .args(["/c", "start", "", url])
         .creation_flags(CREATE_NO_WINDOW)
         .spawn();
+}
+
+const MONTHS_FULL: [&str; 12] = [
+    "january", "february", "march", "april", "may", "june", "july", "august", "september",
+    "october", "november", "december",
+];
+const MONTHS_ABBR: [&str; 12] = [
+    "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+];
+
+/// Parse a trailing "_DD-Mon-YYYY" suffix. Returns (stem, day, month, year).
+fn split_date_suffix(s: &str) -> Option<(&str, u32, u32, i32)> {
+    let i = s.rfind('_')?;
+    let (stem, tail) = (&s[..i], &s[i + 1..]);
+    let mut parts = tail.split('-');
+    let day: u32 = parts.next()?.parse().ok()?;
+    let mon_s = parts.next()?;
+    let year: i32 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if !(1..=31).contains(&day) || !(1900..=2100).contains(&year) {
+        return None;
+    }
+    let mon = MONTHS_ABBR
+        .iter()
+        .position(|m| m.eq_ignore_ascii_case(mon_s))? as u32
+        + 1;
+    Some((stem, day, mon, year))
+}
+
+/// True if the content actually mentions the given date in a common format.
+/// Guards against the model inventing dates that aren't in the file.
+fn date_in_content(content: &str, day: u32, mon: u32, year: i32) -> bool {
+    let lower = content.to_lowercase();
+    let abbr = MONTHS_ABBR[(mon - 1) as usize];
+    let full = MONTHS_FULL[(mon - 1) as usize];
+    let cands = [
+        format!("{day:02}-{abbr}-{year}"),
+        format!("{day}-{abbr}-{year}"),
+        format!("{abbr} {day}, {year}"),
+        format!("{abbr} {day} {year}"),
+        format!("{full} {day}, {year}"),
+        format!("{full} {day} {year}"),
+        format!("{day}/{mon}/{year}"),
+        format!("{mon}/{day}/{year}"),
+        format!("{day:02}/{mon:02}/{year}"),
+        format!("{mon:02}/{day:02}/{year}"),
+        format!("{year}-{mon:02}-{day:02}"),
+        format!("{day:02}.{mon:02}.{year}"),
+    ];
+    cands.iter().any(|c| lower.contains(c.as_str()))
 }
 
 /// If "stem.ext" already exists next to the file, return "stem-02",
