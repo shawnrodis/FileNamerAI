@@ -14,6 +14,13 @@ Built with [Rust](https://www.rust-lang.org/) and [egui](https://www.egui.rs/).
 Single `.exe`, no console window. Runs as a normal user
 (no administrator rights needed).
 
+## Screenshot
+
+<p align="center">
+  <img src="assets/screenshot.png" alt="The File Namer AI settings window: local Ollama connection, model picker, and naming options" width="520">
+  <br><em>The settings window — point it at your local Ollama, pick a model, done.</em>
+</p>
+
 ## Download
 
 Grab the latest `FileNamerAI-Setup-vX.Y.Z.exe` installer from
