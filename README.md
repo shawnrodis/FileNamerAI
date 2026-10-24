@@ -11,7 +11,7 @@ name proposed by a local AI (Ollama). 100% local: no cloud, no API keys,
 no subscriptions.
 
 Built with [Rust](https://www.rust-lang.org/) and [egui](https://www.egui.rs/).
-Single `.exe`, no console window. Runs as a normal user
+Distributed as an installer, no console window. Runs as a normal user
 (no administrator rights needed).
 
 ## Screenshot
