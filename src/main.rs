@@ -371,6 +371,139 @@ fn extract_content(path: &Path) -> Result<Extracted, String> {
 // ollama
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// model management — download models in-app via Ollama's API, no terminal
+// ---------------------------------------------------------------------------
+
+enum ModelMsg {
+    Installed(Vec<String>), // model names from /api/tags
+    CheckFailed,
+    PullProgress {
+        model: String,
+        completed: u64,
+        total: u64,
+        status: String,
+    },
+    PullDone(String),
+    PullFailed(String, String),
+}
+
+/// Does an installed tag satisfy a wanted model? Exact match, or any
+/// variant tag (e.g. "moondream:latest" satisfies "moondream").
+fn tag_matches(tag: &str, wanted: &str) -> bool {
+    tag == wanted || tag.starts_with(&format!("{wanted}:"))
+}
+
+fn check_models(url: &str, tx: mpsc::Sender<ModelMsg>) {
+    let send = |m| {
+        let _ = tx.send(m);
+    };
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => {
+            send(ModelMsg::CheckFailed);
+            return;
+        }
+    };
+    let resp = client
+        .get(format!("{}/api/tags", url.trim_end_matches('/')))
+        .send();
+    let v: serde_json::Value = match resp {
+        Ok(r) if r.status().is_success() => match r.json() {
+            Ok(v) => v,
+            Err(_) => {
+                send(ModelMsg::CheckFailed);
+                return;
+            }
+        },
+        _ => {
+            send(ModelMsg::CheckFailed);
+            return;
+        }
+    };
+    let names: Vec<String> = v["models"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|m| m["name"].as_str().map(|s| s.to_string()))
+        .collect();
+    send(ModelMsg::Installed(names));
+}
+
+/// Pull one model, streaming progress lines from Ollama.
+fn pull_model(url: &str, model: &str, tx: mpsc::Sender<ModelMsg>) {
+    let send = |m| {
+        let _ = tx.send(m);
+    };
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(3600))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => {
+            send(ModelMsg::PullFailed(model.into(), "Couldn't start HTTP client.".into()));
+            return;
+        }
+    };
+    let resp = client
+        .post(format!("{}/api/pull", url.trim_end_matches('/')))
+        .json(&serde_json::json!({"name": model, "stream": true}))
+        .send();
+    let resp = match resp {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r) => {
+            send(ModelMsg::PullFailed(
+                model.into(),
+                format!("Ollama returned HTTP {}.", r.status()),
+            ));
+            return;
+        }
+        Err(e) => {
+            send(ModelMsg::PullFailed(model.into(), format!("Pull failed: {e}")));
+            return;
+        }
+    };
+    use std::io::BufRead;
+    let reader = std::io::BufReader::new(resp);
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Some(err) = v["error"].as_str() {
+            send(ModelMsg::PullFailed(model.into(), err.to_string()));
+            return;
+        }
+        let status = v["status"].as_str().unwrap_or("").to_string();
+        let completed = v["completed"].as_u64().unwrap_or(0);
+        let total = v["total"].as_u64().unwrap_or(0);
+        let _ = tx.send(ModelMsg::PullProgress {
+            model: model.into(),
+            completed,
+            total,
+            status: status.clone(),
+        });
+        if status == "success" {
+            send(ModelMsg::PullDone(model.into()));
+            return;
+        }
+    }
+    // Stream ended without an explicit success — treat as done if we
+    // got this far without an error (Ollama sometimes closes quietly).
+    send(ModelMsg::PullDone(model.into()));
+}
+
 fn ollama_up(url: &str) -> bool {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(5))
@@ -1166,6 +1299,13 @@ struct NamerApp {
     date_source: Option<String>,
     attempt: u32,
     show_about: bool,
+    // model management (in-app downloads)
+    model_rx: Option<mpsc::Receiver<ModelMsg>>,
+    models_installed: Option<Vec<String>>,
+    models_checking: bool,
+    models_checked: bool,
+    pulling: Option<String>,
+    pull_progress: (u64, u64, String), // (completed, total, status)
     // update check
     update_rx: Option<mpsc::Receiver<UpdateMsg>>,
     update_info: Option<ReleaseInfo>,
@@ -1472,6 +1612,12 @@ impl NamerApp {
             date_source: None,
             attempt: 0,
             show_about: false,
+            model_rx: None,
+            models_installed: None,
+            models_checking: false,
+            models_checked: false,
+            pulling: None,
+            pull_progress: (0, 0, String::new()),
             update_rx: None,
             update_info: None,
             update_dismissed: false,
@@ -1587,6 +1733,67 @@ impl NamerApp {
         save_config(&self.cfg);
     }
 
+    fn poll_models(&mut self, ctx: &egui::Context) {
+        // Auto-check once when Settings opens (settings mode only).
+        if !self.is_rename_mode && !self.models_checked && !self.models_checking {
+            self.models_checking = true;
+            let (tx, rx) = mpsc::channel();
+            self.model_rx = Some(rx);
+            let url = self.cfg.ollama_url.clone();
+            thread::spawn(move || check_models(&url, tx));
+        }
+        if self.pulling.is_some() {
+            ctx.request_repaint();
+        }
+        let mut got: Vec<ModelMsg> = Vec::new();
+        if let Some(rx) = &self.model_rx {
+            while let Ok(m) = rx.try_recv() {
+                got.push(m);
+            }
+        }
+        for m in got {
+            match m {
+                ModelMsg::Installed(names) => {
+                    self.models_installed = Some(names);
+                    self.models_checking = false;
+                    self.models_checked = true;
+                }
+                ModelMsg::CheckFailed => {
+                    self.models_checking = false;
+                    self.models_checked = true;
+                    self.models_installed = None;
+                }
+                ModelMsg::PullProgress {
+                    model,
+                    completed,
+                    total,
+                    status,
+                } => {
+                    if self.pulling.as_deref() == Some(model.as_str()) {
+                        self.pull_progress = (completed, total, status);
+                    }
+                }
+                ModelMsg::PullDone(model) => {
+                    self.pulling = None;
+                    self.pull_progress = (0, 0, String::new());
+                    // Refresh the installed list so the button flips to Installed.
+                    self.models_checking = true;
+                    self.models_checked = false;
+                    let (tx, rx) = mpsc::channel();
+                    self.model_rx = Some(rx);
+                    let url = self.cfg.ollama_url.clone();
+                    thread::spawn(move || check_models(&url, tx));
+                    self.settings_status = format!("{model} downloaded.");
+                }
+                ModelMsg::PullFailed(model, err) => {
+                    self.pulling = None;
+                    self.pull_progress = (0, 0, String::new());
+                    self.settings_status = format!("Couldn't download {model}: {err}");
+                }
+            }
+        }
+    }
+
     fn poll_updates(&mut self, ctx: &egui::Context) {
         if self.update_pending {
             ctx.request_repaint();
@@ -1647,8 +1854,9 @@ impl NamerApp {
 
     fn ui_settings(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         self.poll_updates(ctx);
+        self.poll_models(ctx);
         ui.heading("File Namer AI");
-        ui.label("Right-click any file → \"Rename with File Namer AI\" and a local AI proposes a better name.");
+        ui.label("Right-click any file, choose \"Rename with File Namer AI\", and a local AI proposes a better name.");
 
         // update banner
         let upd = self.update_info.clone();
@@ -1734,10 +1942,85 @@ impl NamerApp {
                 ui.label(&self.settings_status);
             }
             ui.add_space(4.0);
-            ui.label("First-time setup: install Ollama from ollama.com, then run:");
-            ui.monospace("ollama pull qwen2.5:3b");
-            ui.monospace("ollama pull moondream  (for PDF OCR)");
+            ui.label("First-time setup: install Ollama from ollama.com, start it, then download the models in the Models section below — no terminal needed.");
         });
+
+        ui.add_space(8.0);
+        {
+            // Models: download right here via Ollama's API, no terminal.
+            let model_name = self.model_edit.trim().to_string();
+            let vision_name = self.vision_model_edit.trim().to_string();
+            let installed = self.models_installed.clone();
+            let checking = self.models_checking;
+            let pulling = self.pulling.clone();
+            let (pc, pt, pstatus) = self.pull_progress.clone();
+            let mut to_pull: Option<String> = None;
+            let mut do_refresh = false;
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.label(egui::RichText::new("Models").strong());
+                ui.label("Download models right here — no terminal needed.");
+                for (wanted, purpose) in [
+                    (model_name.as_str(), "naming documents"),
+                    (vision_name.as_str(), "PDF OCR"),
+                ] {
+                    if wanted.is_empty() {
+                        continue;
+                    }
+                    let is_installed = installed
+                        .as_ref()
+                        .map(|list| list.iter().any(|t| tag_matches(t, wanted)))
+                        .unwrap_or(false);
+                    let is_pulling = pulling.as_deref() == Some(wanted);
+                    ui.horizontal(|ui| {
+                        ui.label(wanted);
+                        ui.label(format!("({purpose})"));
+                        if is_pulling {
+                            if pt > 0 {
+                                ui.label(format!(
+                                    "Downloading… {:.0}% ({:.1} / {:.1} MB) {}",
+                                    pc as f32 / pt as f32 * 100.0,
+                                    pc as f32 / 1_048_576.0,
+                                    pt as f32 / 1_048_576.0,
+                                    pstatus
+                                ));
+                            } else {
+                                ui.label(format!("Downloading… {pstatus}"));
+                            }
+                        } else if checking {
+                            ui.label("Checking…");
+                        } else if installed.is_none() {
+                            ui.label("Can't reach Ollama.");
+                        } else if is_installed {
+                            ui.label(
+                                egui::RichText::new("Installed")
+                                    .color(egui::Color32::GREEN),
+                            );
+                        } else if ui.button("Download").clicked() {
+                            to_pull = Some(wanted.to_string());
+                        }
+                    });
+                }
+                if ui.button("Refresh").clicked() {
+                    do_refresh = true;
+                }
+            });
+            if let Some(m) = to_pull {
+                self.pulling = Some(m.clone());
+                self.pull_progress = (0, 0, String::new());
+                let (tx, rx) = mpsc::channel();
+                self.model_rx = Some(rx);
+                let url = self.cfg.ollama_url.clone();
+                thread::spawn(move || pull_model(&url, &m, tx));
+            }
+            if do_refresh {
+                self.models_checking = true;
+                self.models_checked = false;
+                let (tx, rx) = mpsc::channel();
+                self.model_rx = Some(rx);
+                let url = self.cfg.ollama_url.clone();
+                thread::spawn(move || check_models(&url, tx));
+            }
+        }
 
         ui.add_space(8.0);
         egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -1775,6 +2058,16 @@ impl NamerApp {
                     }
                 }
             }
+        });
+
+        ui.add_space(8.0);
+        ui.collapsing("How photo and video dating works", |ui| {
+            ui.label("Photos and videos are named from dates — no AI involved.");
+            ui.label("• Photos with a real Date Taken in EXIF keep full seconds (MM-DD-YY-HH-MM-SS).");
+            ui.label("• Photos without real Date Taken (screenshots, chat downloads) are truncated to the minute (:00 seconds).");
+            ui.label("• Videos use the embedded media-created date, always truncated to the minute (:00).");
+            ui.label("• If the dates disagree, the earliest one wins (EXIF/media date, file Created, file Modified).");
+            ui.label("• Two files sharing a timestamp get _1, _2 suffixes; already-correct names are left alone.");
         });
 
         ui.add_space(8.0);
