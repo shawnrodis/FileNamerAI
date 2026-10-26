@@ -1736,6 +1736,7 @@ impl NamerApp {
             ui.add_space(4.0);
             ui.label("First-time setup: install Ollama from ollama.com, then run:");
             ui.monospace("ollama pull qwen2.5:3b");
+            ui.monospace("ollama pull moondream  (for PDF OCR)");
         });
 
         ui.add_space(8.0);
@@ -1822,6 +1823,7 @@ impl NamerApp {
                 ui.label(egui::RichText::new("Can't reach Ollama.").strong());
                 ui.label("Install it from ollama.com, then run:");
                 ui.monospace("ollama pull qwen2.5:3b");
+                ui.monospace("ollama pull moondream  (for PDF OCR)");
                 ui.monospace("ollama serve");
                 ui.add_space(8.0);
                 if ui.button("Close").clicked() {
