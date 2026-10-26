@@ -1421,6 +1421,7 @@ struct NamerApp {
     never_dates: bool,
     force_ocr: bool,
     settings_status: String,
+    drop_status: String,
     menu_on: bool,
     // rename flow
     rx: Option<mpsc::Receiver<WorkerMsg>>,
@@ -1740,6 +1741,7 @@ impl NamerApp {
             never_dates: cfg.never_dates,
             cfg,
             settings_status: String::new(),
+            drop_status: String::new(),
             menu_on: menu_installed(),
             rx: None,
             state: RenameState::Working,
@@ -2039,8 +2041,87 @@ impl NamerApp {
         self.poll_updates(ctx);
         self.poll_models(ctx);
         self.poll_ollama_dl(ctx);
+
+        // Drag-and-drop: files dropped onto the Settings window.
+        // egui reports each drop once, on the frame it lands.
+        let dropped_raw = ctx.input(|i| i.raw.dropped_files.clone());
+        let hovering = ctx.input(|i| !i.raw.hovered_files.is_empty());
+        if !dropped_raw.is_empty() {
+            // Directories and pathless drops are ignored, never a crash.
+            let files: Vec<PathBuf> = dropped_raw
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .filter(|p| p.is_file())
+                .collect();
+            if files.is_empty() {
+                self.drop_status =
+                    "That drop had no files in it — drop a file to rename it.".into();
+            } else if files.len() == 1 {
+                // Single file: rename it in this same window, no relaunch.
+                // Save the visible settings first so the worker uses them.
+                self.save_settings_from_ui();
+                let file = files.into_iter().next().unwrap();
+                self.file_ext = file
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                self.file_path = Some(file);
+                self.is_rename_mode = true;
+                self.suggestion.clear();
+                self.date_source = None;
+                self.attempt = 0;
+                self.start_worker();
+                return;
+            } else {
+                // Multiple files: hand them to a fresh process, whose
+                // coordinate_files()/BatchApp path opens one batch window.
+                let count = files.len();
+                let spawned = std::env::current_exe()
+                    .map_err(|e| e.to_string())
+                    .and_then(|exe| {
+                        std::process::Command::new(exe)
+                            .args(&files)
+                            .spawn()
+                            .map_err(|e| e.to_string())
+                    });
+                match spawned {
+                    Ok(_) => {
+                        self.drop_status =
+                            format!("{count} files dropped — opening the batch window…");
+                    }
+                    Err(e) => {
+                        self.drop_status =
+                            format!("Couldn't open the batch window: {e}");
+                    }
+                }
+            }
+        }
+
         ui.heading("File Namer AI");
-        ui.label("Right-click any file, choose \"Rename with File Namer AI\", and a local AI proposes a better name.");
+        if cfg!(windows) {
+            ui.label("Right-click any file, choose \"Rename with File Namer AI\", and a local AI proposes a better name.");
+        } else {
+            ui.label("Drag files onto this window and a local AI proposes a better name.");
+        }
+
+        // Drop zone: a visible affordance, highlighted while files hover.
+        let mut drop_frame = egui::Frame::group(ui.style());
+        if hovering {
+            drop_frame.fill = egui::Color32::from_rgb(38, 70, 120);
+        }
+        drop_frame.show(ui, |ui| {
+            ui.label(egui::RichText::new("Drop files here to rename them").strong());
+            if hovering {
+                ui.label(egui::RichText::new("Release to drop").strong());
+            } else {
+                ui.label("One file opens the rename dialog right here. Several files open the batch window.");
+            }
+            if !self.drop_status.is_empty() {
+                ui.label(&self.drop_status);
+            }
+        });
+        ui.add_space(8.0);
 
         ui.horizontal(|ui| {
             if ui.button("Check for updates").clicked() {
@@ -2311,6 +2392,7 @@ impl NamerApp {
                 }
             });
             ui.label("Note: on Windows 11 the item lives under \"Show more options\".");
+            ui.label("You can also drag files onto this window to rename them.");
             if self.menu_on {
                 match multiselect_model() {
                     Some(m) => {
@@ -2325,7 +2407,7 @@ impl NamerApp {
         } else {
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.label(egui::RichText::new("Right-click menu").strong());
-                ui.label("Right-click menu integration is Windows-only. On Mac, open files from the app or drag them onto it.");
+                ui.label("Right-click menu integration is Windows-only. On Mac, drag files onto this window to rename them — one file opens the rename dialog here, several open the batch window.");
             });
         }
 
