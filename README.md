@@ -17,8 +17,8 @@ Distributed as an installer, no console window. Runs as a normal user
 ## Screenshot
 
 <p align="center">
-  <img src="assets/screenshot.png" alt="The File Namer AI settings window: local Ollama connection, model picker, and naming options" width="520">
-  <br><em>The settings window — point it at your local Ollama, pick a model, done.</em>
+  <img src="assets/screenshot.png" alt="The File Namer AI settings window: update check, Ollama connection, in-app model downloads, and naming options" width="520">
+  <br><em>The settings window — updates at the top, models downloadable in-app, done.</em>
 </p>
 
 ## Download
