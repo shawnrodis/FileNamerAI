@@ -1990,6 +1990,21 @@ impl NamerApp {
         ui.heading("File Namer AI");
         ui.label("Right-click any file, choose \"Rename with File Namer AI\", and a local AI proposes a better name.");
 
+        ui.horizontal(|ui| {
+            if ui.button("Check for updates").clicked() {
+                let (tx2, rx2) = mpsc::channel();
+                self.update_rx = Some(rx2);
+                self.update_dismissed = false;
+                self.update_info = None;
+                self.update_status = "Checking…".into();
+                self.update_pending = true;
+                thread::spawn(move || check_updates(tx2));
+            }
+            if !self.update_status.is_empty() {
+                ui.label(&self.update_status);
+            }
+        });
+
         // update banner
         let upd = self.update_info.clone();
         if let Some(info) = upd {
@@ -2043,26 +2058,6 @@ impl NamerApp {
                     egui::TextEdit::singleline(&mut self.url_edit).desired_width(280.0),
                 );
             });
-            ui.horizontal(|ui| {
-                ui.label("Model:");
-                ui.add(egui::TextEdit::singleline(&mut self.model_edit).desired_width(280.0));
-                if ui.button("Test").clicked() {
-                    self.save_settings_from_ui();
-                    self.settings_status = if ollama_up(&self.cfg.ollama_url) {
-                        format!("Connected — model \"{}\" is reachable.", self.cfg.model)
-                    } else {
-                        "Can't reach Ollama. Is it installed and running? (ollama serve)".into()
-                    };
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.label("Vision model (for OCR):");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.vision_model_edit)
-                        .desired_width(280.0),
-                );
-            });
-            ui.label("Used when a PDF has no readable text, or when Force AI OCR is on. Pull it first: ollama pull moondream");
             ui.checkbox(&mut self.append_date, "Append date (_DD-Mon-YYYY) when the content has one");
             ui.checkbox(&mut self.never_dates, "Never add dates to document names");
             ui.checkbox(&mut self.force_ocr, "Force AI OCR for PDFs (ignore the text layer, read the images instead)");
@@ -2079,9 +2074,7 @@ impl NamerApp {
 
         ui.add_space(8.0);
         {
-            // Models: download right here via Ollama's API, no terminal.
-            let model_name = self.model_edit.trim().to_string();
-            let vision_name = self.vision_model_edit.trim().to_string();
+            // Models: view, rename, and download right here — no terminal.
             let installed = self.models_installed.clone();
             let checking = self.models_checking;
             let pulling = self.pulling.clone();
@@ -2094,22 +2087,24 @@ impl NamerApp {
             let ollama_dl_status = self.ollama_dl_status.clone();
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.label(egui::RichText::new("Models").strong());
-                ui.label("Download models right here — no terminal needed.");
-                for (wanted, purpose) in [
-                    (model_name.as_str(), "naming documents"),
-                    (vision_name.as_str(), "PDF OCR"),
-                ] {
+                ui.label("Edit a name to switch models, then Save settings. Download right here — no terminal needed.");
+                // Row helper inlined twice (naming + vision) since each
+                // edits a different field.
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.model_edit)
+                            .desired_width(160.0),
+                    );
+                    ui.label("(naming documents)");
+                    let wanted = self.model_edit.trim().to_string();
                     if wanted.is_empty() {
-                        continue;
-                    }
-                    let is_installed = installed
-                        .as_ref()
-                        .map(|list| list.iter().any(|t| tag_matches(t, wanted)))
-                        .unwrap_or(false);
-                    let is_pulling = pulling.as_deref() == Some(wanted);
-                    ui.horizontal(|ui| {
-                        ui.label(wanted);
-                        ui.label(format!("({purpose})"));
+                        ui.label("Enter a model name.");
+                    } else {
+                        let is_installed = installed
+                            .as_ref()
+                            .map(|list| list.iter().any(|t| tag_matches(t, &wanted)))
+                            .unwrap_or(false);
+                        let is_pulling = pulling.as_deref() == Some(wanted.as_str());
                         if is_pulling {
                             if pt > 0 {
                                 ui.label(format!(
@@ -2132,10 +2127,51 @@ impl NamerApp {
                                     .color(egui::Color32::GREEN),
                             );
                         } else if ui.button("Download").clicked() {
-                            to_pull = Some(wanted.to_string());
+                            to_pull = Some(wanted);
                         }
-                    });
-                }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.vision_model_edit)
+                            .desired_width(160.0),
+                    );
+                    ui.label("(PDF OCR)");
+                    let wanted = self.vision_model_edit.trim().to_string();
+                    if wanted.is_empty() {
+                        ui.label("Enter a model name.");
+                    } else {
+                        let is_installed = installed
+                            .as_ref()
+                            .map(|list| list.iter().any(|t| tag_matches(t, &wanted)))
+                            .unwrap_or(false);
+                        let is_pulling = pulling.as_deref() == Some(wanted.as_str());
+                        if is_pulling {
+                            if pt > 0 {
+                                ui.label(format!(
+                                    "Downloading… {:.0}% ({:.1} / {:.1} MB) {}",
+                                    pc as f32 / pt as f32 * 100.0,
+                                    pc as f32 / 1_048_576.0,
+                                    pt as f32 / 1_048_576.0,
+                                    pstatus
+                                ));
+                            } else {
+                                ui.label(format!("Downloading… {pstatus}"));
+                            }
+                        } else if checking {
+                            ui.label("Checking…");
+                        } else if installed.is_none() {
+                            ui.label("Can't reach Ollama.");
+                        } else if is_installed {
+                            ui.label(
+                                egui::RichText::new("Installed")
+                                    .color(egui::Color32::GREEN),
+                            );
+                        } else if ui.button("Download").clicked() {
+                            to_pull = Some(wanted);
+                        }
+                    }
+                });
                 if ui.button("Refresh").clicked() {
                     do_refresh = true;
                 }
@@ -2166,14 +2202,6 @@ impl NamerApp {
                     }
                 }
             });
-            if to_dl_ollama {
-                self.ollama_downloading = true;
-                self.ollama_dl_progress = (0, 0);
-                self.ollama_dl_status.clear();
-                let (tx, rx) = mpsc::channel();
-                self.ollama_dl_rx = Some(rx);
-                thread::spawn(move || download_ollama_installer(tx));
-            }
             if let Some(m) = to_pull {
                 self.pulling = Some(m.clone());
                 self.pull_progress = (0, 0, String::new());
@@ -2189,6 +2217,14 @@ impl NamerApp {
                 self.model_rx = Some(rx);
                 let url = self.cfg.ollama_url.clone();
                 thread::spawn(move || check_models(&url, tx));
+            }
+            if to_dl_ollama {
+                self.ollama_downloading = true;
+                self.ollama_dl_progress = (0, 0);
+                self.ollama_dl_status.clear();
+                let (tx, rx) = mpsc::channel();
+                self.ollama_dl_rx = Some(rx);
+                thread::spawn(move || download_ollama_installer(tx));
             }
         }
 
@@ -2242,18 +2278,6 @@ impl NamerApp {
 
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            if ui.button("Check for updates").clicked() {
-                let (tx2, rx2) = mpsc::channel();
-                self.update_rx = Some(rx2);
-                self.update_dismissed = false;
-                self.update_info = None;
-                self.update_status = "Checking…".into();
-                self.update_pending = true;
-                thread::spawn(move || check_updates(tx2));
-            }
-            if !self.update_status.is_empty() {
-                ui.label(&self.update_status);
-            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("About").clicked() {
                     self.show_about = true;
