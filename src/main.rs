@@ -504,6 +504,91 @@ fn pull_model(url: &str, model: &str, tx: mpsc::Sender<ModelMsg>) {
     send(ModelMsg::PullDone(model.into()));
 }
 
+// ---------------------------------------------------------------------------
+// Ollama itself — download + launch the official installer, no website trip
+// ---------------------------------------------------------------------------
+
+const OLLAMA_SETUP_URL: &str = "https://ollama.com/download/OllamaSetup.exe";
+
+enum OllamaDlMsg {
+    Progress(u64, u64),
+    Done(std::path::PathBuf),
+    Failed(String),
+}
+
+fn download_ollama_installer(tx: mpsc::Sender<OllamaDlMsg>) {
+    let send = |m| {
+        let _ = tx.send(m);
+    };
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(3600))
+        .user_agent("FileNamerAI-ollama-download")
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => {
+            send(OllamaDlMsg::Failed("Couldn't start HTTP client.".into()));
+            return;
+        }
+    };
+    let mut resp = match client.get(OLLAMA_SETUP_URL).send() {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r) => {
+            send(OllamaDlMsg::Failed(format!(
+                "Download failed (HTTP {}).",
+                r.status()
+            )));
+            return;
+        }
+        Err(e) => {
+            send(OllamaDlMsg::Failed(format!("Download failed: {e}")));
+            return;
+        }
+    };
+    let total = resp.content_length().unwrap_or(0);
+    let dest = std::env::temp_dir().join("OllamaSetup.exe");
+    let mut file = match std::fs::File::create(&dest) {
+        Ok(f) => f,
+        Err(_) => {
+            send(OllamaDlMsg::Failed("Couldn't write the installer file.".into()));
+            return;
+        }
+    };
+    let mut got: u64 = 0;
+    let mut buf = [0u8; 8192];
+    use std::io::Read;
+    use std::io::Write;
+    loop {
+        match resp.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if file.write_all(&buf[..n]).is_err() {
+                    send(OllamaDlMsg::Failed("Couldn't write the installer file.".into()));
+                    return;
+                }
+                got += n as u64;
+                let _ = tx.send(OllamaDlMsg::Progress(got, total));
+            }
+            Err(_) => {
+                send(OllamaDlMsg::Failed("Download interrupted.".into()));
+                return;
+            }
+        }
+    }
+    match std::fs::metadata(&dest) {
+        Ok(m) if m.len() > 0 => send(OllamaDlMsg::Done(dest)),
+        _ => send(OllamaDlMsg::Failed("Downloaded file is empty.".into())),
+    }
+}
+
+/// Open a URL in the default browser (fallback when a download fails).
+fn open_url(url: &str) {
+    let _ = Command::new("cmd")
+        .args(["/c", "start", "", url])
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn();
+}
+
 fn ollama_up(url: &str) -> bool {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(5))
@@ -1299,6 +1384,11 @@ struct NamerApp {
     date_source: Option<String>,
     attempt: u32,
     show_about: bool,
+    // Ollama installer download
+    ollama_dl_rx: Option<mpsc::Receiver<OllamaDlMsg>>,
+    ollama_downloading: bool,
+    ollama_dl_progress: (u64, u64),
+    ollama_dl_status: String,
     // model management (in-app downloads)
     model_rx: Option<mpsc::Receiver<ModelMsg>>,
     models_installed: Option<Vec<String>>,
@@ -1612,6 +1702,10 @@ impl NamerApp {
             date_source: None,
             attempt: 0,
             show_about: false,
+            ollama_dl_rx: None,
+            ollama_downloading: false,
+            ollama_dl_progress: (0, 0),
+            ollama_dl_status: String::new(),
             model_rx: None,
             models_installed: None,
             models_checking: false,
@@ -1731,6 +1825,43 @@ impl NamerApp {
         self.cfg.never_dates = self.never_dates;
         self.cfg.force_ocr = self.force_ocr;
         save_config(&self.cfg);
+    }
+
+    fn poll_ollama_dl(&mut self, ctx: &egui::Context) {
+        if self.ollama_downloading {
+            ctx.request_repaint();
+        }
+        let mut got: Vec<OllamaDlMsg> = Vec::new();
+        if let Some(rx) = &self.ollama_dl_rx {
+            while let Ok(m) = rx.try_recv() {
+                got.push(m);
+            }
+        }
+        for m in got {
+            match m {
+                OllamaDlMsg::Progress(got_b, total) => {
+                    self.ollama_dl_progress = (got_b, total);
+                }
+                OllamaDlMsg::Done(path) => {
+                    self.ollama_downloading = false;
+                    // Launch the official installer WITH its UI so the
+                    // user clicks through it (no silent install).
+                    match Command::new(&path).spawn() {
+                        Ok(_) => {
+                            self.ollama_dl_status = "Ollama installer launched — complete its steps, then come back and Refresh.".into();
+                        }
+                        Err(e) => {
+                            self.ollama_dl_status =
+                                format!("Couldn't launch the installer: {e}");
+                        }
+                    }
+                }
+                OllamaDlMsg::Failed(err) => {
+                    self.ollama_downloading = false;
+                    self.ollama_dl_status = err;
+                }
+            }
+        }
     }
 
     fn poll_models(&mut self, ctx: &egui::Context) {
@@ -1855,6 +1986,7 @@ impl NamerApp {
     fn ui_settings(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         self.poll_updates(ctx);
         self.poll_models(ctx);
+        self.poll_ollama_dl(ctx);
         ui.heading("File Namer AI");
         ui.label("Right-click any file, choose \"Rename with File Namer AI\", and a local AI proposes a better name.");
 
@@ -1956,6 +2088,10 @@ impl NamerApp {
             let (pc, pt, pstatus) = self.pull_progress.clone();
             let mut to_pull: Option<String> = None;
             let mut do_refresh = false;
+            let mut to_dl_ollama = false;
+            let ollama_downloading = self.ollama_downloading;
+            let ollama_dl_progress = self.ollama_dl_progress;
+            let ollama_dl_status = self.ollama_dl_status.clone();
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.label(egui::RichText::new("Models").strong());
                 ui.label("Download models right here — no terminal needed.");
@@ -2003,7 +2139,41 @@ impl NamerApp {
                 if ui.button("Refresh").clicked() {
                     do_refresh = true;
                 }
+                // Ollama itself missing: download + launch its installer.
+                if installed.is_none() && !checking {
+                    ui.add_space(4.0);
+                    ui.label("Ollama isn't installed or isn't running.");
+                    if ollama_downloading {
+                        let (got_b, total_b) = ollama_dl_progress;
+                        if total_b > 0 {
+                            ui.label(format!(
+                                "Downloading Ollama… {:.0}% ({:.1} / {:.1} MB)",
+                                got_b as f32 / total_b as f32 * 100.0,
+                                got_b as f32 / 1_048_576.0,
+                                total_b as f32 / 1_048_576.0
+                            ));
+                        } else {
+                            ui.label("Downloading Ollama…");
+                        }
+                    } else if ui.button("Download & Install Ollama").clicked() {
+                        to_dl_ollama = true;
+                    }
+                    if ui.button("Open ollama.com").clicked() {
+                        open_url("https://ollama.com");
+                    }
+                    if !ollama_dl_status.is_empty() {
+                        ui.label(ollama_dl_status.as_str());
+                    }
+                }
             });
+            if to_dl_ollama {
+                self.ollama_downloading = true;
+                self.ollama_dl_progress = (0, 0);
+                self.ollama_dl_status.clear();
+                let (tx, rx) = mpsc::channel();
+                self.ollama_dl_rx = Some(rx);
+                thread::spawn(move || download_ollama_installer(tx));
+            }
             if let Some(m) = to_pull {
                 self.pulling = Some(m.clone());
                 self.pull_progress = (0, 0, String::new());
@@ -2094,6 +2264,7 @@ impl NamerApp {
 
     fn ui_rename(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         self.poll_worker(ctx);
+        self.poll_ollama_dl(ctx);
         let fname = self
             .file_path
             .as_ref()
@@ -2118,6 +2289,33 @@ impl NamerApp {
                 ui.monospace("ollama pull qwen2.5:3b");
                 ui.monospace("ollama pull moondream  (for PDF OCR)");
                 ui.monospace("ollama serve");
+                ui.add_space(8.0);
+                if self.ollama_downloading {
+                    let (got_b, total_b) = self.ollama_dl_progress;
+                    if total_b > 0 {
+                        ui.label(format!(
+                            "Downloading Ollama… {:.0}% ({:.1} / {:.1} MB)",
+                            got_b as f32 / total_b as f32 * 100.0,
+                            got_b as f32 / 1_048_576.0,
+                            total_b as f32 / 1_048_576.0
+                        ));
+                    } else {
+                        ui.label("Downloading Ollama…");
+                    }
+                } else if ui.button("Download & Install Ollama").clicked() {
+                    self.ollama_downloading = true;
+                    self.ollama_dl_progress = (0, 0);
+                    self.ollama_dl_status.clear();
+                    let (tx, rx) = mpsc::channel();
+                    self.ollama_dl_rx = Some(rx);
+                    thread::spawn(move || download_ollama_installer(tx));
+                }
+                if ui.button("Open ollama.com").clicked() {
+                    open_url("https://ollama.com");
+                }
+                if !self.ollama_dl_status.is_empty() {
+                    ui.label(self.ollama_dl_status.as_str());
+                }
                 ui.add_space(8.0);
                 if ui.button("Close").clicked() {
                     std::process::exit(0);
