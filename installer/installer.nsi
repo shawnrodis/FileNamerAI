@@ -4,7 +4,7 @@
 ; context menu (HKCU), and creates an Add/Remove Programs entry.
 
 !define APP_NAME "File Namer AI"
-!define APP_VERSION "1.3.17"
+!define APP_VERSION "1.3.18"
 !define APP_PUBLISHER "Shawn Rodis"
 !define APP_URL "https://github.com/shawnrodis/FileNamerAI"
 

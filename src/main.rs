@@ -356,6 +356,186 @@ fn mp4_creation_datetime(path: &Path) -> Option<chrono::NaiveDateTime> {
     None
 }
 
+/// Unescape the XML entities found in Office document XML, including
+/// numeric character references (&#65; / &#x41;). `&amp;` is decoded last
+/// so a doubly-escaped sequence does not get decoded twice.
+fn unescape_xml_entities(s: &str) -> String {
+    // Numeric references first.
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after = &rest[amp + 1..];
+        match after.find(';') {
+            Some(semi) if semi <= 10 => {
+                let body = &after[..semi];
+                let decoded = if let Some(hex) = body.strip_prefix("#x").or_else(|| body.strip_prefix("#X")) {
+                    u32::from_str_radix(hex, 16).ok().and_then(char::from_u32)
+                } else if let Some(dec) = body.strip_prefix('#') {
+                    dec.parse::<u32>().ok().and_then(char::from_u32)
+                } else {
+                    None
+                };
+                match decoded {
+                    Some(c) => out.push(c),
+                    None => {
+                        out.push('&');
+                        out.push_str(body);
+                        out.push(';');
+                    }
+                }
+                rest = &after[semi + 1..];
+            }
+            _ => {
+                out.push('&');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+/// Strip XML tags from Office document XML, keeping paragraph/row breaks.
+/// Text nodes that were separated only by a tag get a space, so
+/// `<t>foo</t><t>bar</t>` becomes "foo bar", not "foobar".
+fn xml_to_plain_text(xml: &str) -> String {
+    let mut out = String::new();
+    let mut rest = xml;
+    while let Some(lt) = rest.find('<') {
+        out.push_str(&rest[..lt]);
+        let after = &rest[lt + 1..];
+        let Some(gt) = after.find('>') else { break };
+        let tag = after[..gt].trim();
+        let (is_close, name) = match tag.strip_prefix('/') {
+            Some(n) => (true, n.split_whitespace().next().unwrap_or("")),
+            None => (
+                false,
+                tag.split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .trim_end_matches('/'),
+            ),
+        };
+        if name == "br" || name == "w:br" || name.ends_with(":br") {
+            out.push('\n');
+        } else if is_close
+            && (name == "p"
+                || name.ends_with(":p")
+                || name == "tr"
+                || name.ends_with(":tr")
+                || name == "si"
+                || name == "row")
+        {
+            out.push('\n');
+        } else {
+            out.push(' ');
+        }
+        rest = &after[gt + 1..];
+    }
+    out.push_str(rest);
+    let unescaped = unescape_xml_entities(&out);
+    unescaped
+        .lines()
+        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn read_zip_entry_text(path: &Path, entry: &str) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut archive = zip::ZipArchive::new(file).ok()?;
+    let mut entry_file = archive.by_name(entry).ok()?;
+    let mut xml = String::new();
+    use std::io::Read as _;
+    entry_file.read_to_string(&mut xml).ok()?;
+    Some(xml)
+}
+
+fn zip_entry_names(path: &Path) -> Vec<String> {
+    let Ok(file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let Ok(archive) = zip::ZipArchive::new(file) else {
+        return Vec::new();
+    };
+    archive.file_names().map(|s| s.to_string()).collect()
+}
+
+/// Plain text from one main ZIP/XML entry, plus any extra entries whose
+/// names start with one of `extra_prefixes` (e.g. DOCX headers/footers).
+fn office_zip_text(path: &Path, main: &str, extra_prefixes: &[&str]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(xml) = read_zip_entry_text(path, main) {
+        let plain = xml_to_plain_text(&xml);
+        if !plain.trim().is_empty() {
+            parts.push(plain);
+        }
+    }
+    if !extra_prefixes.is_empty() {
+        for name in zip_entry_names(path) {
+            if name != main
+                && name.ends_with(".xml")
+                && extra_prefixes.iter().any(|p| name.starts_with(p))
+            {
+                if let Some(xml) = read_zip_entry_text(path, &name) {
+                    let plain = xml_to_plain_text(&xml);
+                    if !plain.trim().is_empty() {
+                        parts.push(plain);
+                    }
+                }
+            }
+        }
+    }
+    parts.join("\n")
+}
+
+/// XLSX text: shared strings first (the actual cell text); fall back to
+/// sheet XML, which at least yields the stored values.
+fn xlsx_text(path: &Path) -> String {
+    let shared = office_zip_text(path, "xl/sharedStrings.xml", &[]);
+    if !shared.trim().is_empty() {
+        return shared;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    let mut names = zip_entry_names(path);
+    names.sort();
+    for name in names {
+        if name.starts_with("xl/worksheets/sheet") && name.ends_with(".xml") {
+            if let Some(xml) = read_zip_entry_text(path, &name) {
+                let plain = xml_to_plain_text(&xml);
+                if !plain.trim().is_empty() {
+                    parts.push(plain);
+                }
+            }
+        }
+    }
+    parts.join("\n")
+}
+
+/// PPTX text: every slide, in slide order.
+fn pptx_text(path: &Path) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut names = zip_entry_names(path);
+    names.sort();
+    for name in names {
+        if name.starts_with("ppt/slides/slide") && name.ends_with(".xml") {
+            if let Some(xml) = read_zip_entry_text(path, &name) {
+                let plain = xml_to_plain_text(&xml);
+                if !plain.trim().is_empty() {
+                    parts.push(plain);
+                }
+            }
+        }
+    }
+    parts.join("\n")
+}
+
 /// Best available timestamp: EXIF (photos) / embedded media date (videos),
 /// then file Created, then Modified, then now.
 fn extract_content(path: &Path) -> Result<Extracted, String> {
@@ -372,6 +552,42 @@ fn extract_content(path: &Path) -> Result<Extracted, String> {
             let text: String = text.chars().take(MAX_CONTENT_CHARS).collect();
             if text.trim().is_empty() {
                 return Err("This PDF has no readable text (it may be scanned images).".into());
+            }
+            Ok(Extracted::Text(text))
+        }
+        // Office documents are ZIP/XML: DOCX word/document.xml (+
+        // headers/footers), ODT content.xml, XLSX shared strings,
+        // PPTX slide XML. The extracted text then goes through the
+        // same Ollama naming, date guard, and title guard as PDFs.
+        "docx" => {
+            let text = office_zip_text(path, "word/document.xml", &["word/header", "word/footer"]);
+            let text: String = text.chars().take(MAX_CONTENT_CHARS).collect();
+            if text.trim().is_empty() {
+                return Err("This document has no readable text.".into());
+            }
+            Ok(Extracted::Text(text))
+        }
+        "odt" => {
+            let text = office_zip_text(path, "content.xml", &[]);
+            let text: String = text.chars().take(MAX_CONTENT_CHARS).collect();
+            if text.trim().is_empty() {
+                return Err("This document has no readable text.".into());
+            }
+            Ok(Extracted::Text(text))
+        }
+        "xlsx" => {
+            let text = xlsx_text(path);
+            let text: String = text.chars().take(MAX_CONTENT_CHARS).collect();
+            if text.trim().is_empty() {
+                return Err("This document has no readable text.".into());
+            }
+            Ok(Extracted::Text(text))
+        }
+        "pptx" => {
+            let text = pptx_text(path);
+            let text: String = text.chars().take(MAX_CONTENT_CHARS).collect();
+            if text.trim().is_empty() {
+                return Err("This document has no readable text.".into());
             }
             Ok(Extracted::Text(text))
         }
@@ -394,9 +610,22 @@ fn extract_content(path: &Path) -> Result<Extracted, String> {
             let (dt, src) = best_datetime(path, true);
             Ok(Extracted::DateTime(dt, src))
         }
-        _ => Err(format!(
-            "Unsupported file type: .{ext} (PDF, text, photos and videos work)"
-        )),
+        _ => {
+            // Any other file type: if it reads as plain text, name it
+            // from its contents like a text document. Otherwise, don't
+            // error out for the extension alone — fall back to
+            // date-based naming from the file's own dates, like
+            // photos/videos (earliest of created/modified, via
+            // best_datetime).
+            if let Ok(text) = std::fs::read_to_string(path) {
+                let text: String = text.chars().take(MAX_CONTENT_CHARS).collect();
+                if !text.trim().is_empty() {
+                    return Ok(Extracted::Text(text));
+                }
+            }
+            let (dt, src) = best_datetime(path, false);
+            Ok(Extracted::DateTime(dt, src))
+        }
     }
 }
 
@@ -3005,4 +3234,60 @@ fn main() {
             }
         }),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write as _;
+
+    #[test]
+    fn docx_xml_to_plain_text_keeps_paragraphs_and_unescapes() {
+        let xml = r#"<?xml version="1.0"?><w:document><w:body><w:p><w:r><w:t>Screening Notification</w:t></w:r></w:p><w:p><w:r><w:t>From: First Advantage &amp; Co</w:t></w:r></w:p><w:p><w:r><w:t>26-Oct-2026</w:t></w:r></w:p></w:body></w:document>"#;
+        let plain = xml_to_plain_text(xml);
+        assert_eq!(
+            plain,
+            "Screening Notification\nFrom: First Advantage & Co\n26-Oct-2026"
+        );
+    }
+
+    #[test]
+    fn docx_extraction_reads_document_xml_from_a_zip() {
+        let dir = std::env::temp_dir().join(format!("filenamer_docx_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test.docx");
+        {
+            let file = std::fs::File::create(&path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zip.start_file("word/document.xml", opts).unwrap();
+            zip.write_all(
+                br#"<?xml version="1.0"?><w:document><w:body><w:p><w:r><w:t>Quarterly Report</w:t></w:r></w:p><w:p><w:r><w:t>Revenue grew in Q3 2026</w:t></w:r></w:p></w:body></w:document>"#,
+            )
+            .unwrap();
+            zip.finish().unwrap();
+        }
+        match extract_content(&path) {
+            Ok(Extracted::Text(text)) => {
+                assert!(text.contains("Quarterly Report"), "got: {text}");
+                assert!(text.contains("Revenue grew in Q3 2026"), "got: {text}");
+            }
+             _ => panic!("expected Text extraction"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unknown_binary_type_falls_back_to_date_not_an_error() {
+        let dir = std::env::temp_dir().join(format!("filenamer_bin_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("mystery.xyzbin");
+        std::fs::write(&path, [0xffu8, 0xfe, 0x00, 0x01]).unwrap();
+        match extract_content(&path) {
+            Ok(Extracted::DateTime(_, _)) => {}
+             _ => panic!("expected date fallback"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
