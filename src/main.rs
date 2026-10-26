@@ -400,10 +400,14 @@ fn build_prompt(original: &str, content: &str, append_date: bool, attempt: u32) 
     format!(
         "Propose a concise descriptive filename for the file described below.\n\
          \n\
+         First, figure out what the document IS: its main heading or subject, who sent it, and what kind of document it is (notification, invoice, letter, confirmation, statement, etc.). The title should name that subject — sender + document type when possible (e.g. First Advantage Screening Notification).\n\
+         \n\
          Rules (follow exactly):\n\
          - Output ONLY the filename: no quotes, no explanation, no file extension.\n\
          - Use spaces between words with normal Title Case (e.g. Example Document Title). Never ALL CAPS.\n\
          - The title must use ONLY words that appear in the document content below. Never invent a title or borrow words from these instructions.\n\
+         - NEVER use a field label as the title: not Today's Date, From, To, Subject, Date, an address, a phone number, or any other metadata label. Those describe the document; they are not its subject.\n\
+         - Ignore email headers (From/To/Date lines), page headers/footers, and boilerplate — name the document by its actual content, not its envelope.\n\
          - Maximum 50 characters.\n\
          {date_rule}\
          {retry_rule}\
