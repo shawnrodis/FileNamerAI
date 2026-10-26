@@ -552,19 +552,27 @@ fn ocr_pdf(cfg: &Config, path: &Path) -> Result<String, String> {
         );
     }
     let mut parts = Vec::new();
+    let mut first_err: Option<String> = None;
     for img in &images {
         match ocr_image(cfg, img) {
             Ok(t) => parts.push(t),
             Err(e) => {
-                // If the first image fails (e.g. model not pulled),
-                // bail immediately — retrying the rest won't help.
-                if parts.is_empty() {
+                // A model-level failure (e.g. not pulled) means the
+                // rest won't work either — bail immediately.
+                // But an image with no readable text (a logo, a
+                // blank page) just gets skipped; try the next one.
+                if e.contains("returned") && e.contains("404") {
                     return Err(e);
                 }
-                // Otherwise keep what we have and move on.
-                break;
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+                continue;
             }
         }
+    }
+    if parts.is_empty() {
+        return Err(first_err.unwrap_or_else(|| "OCR produced no text.".into()));
     }
     let combined = parts.join("\n").trim().to_string();
     if combined.is_empty() {
@@ -1179,12 +1187,21 @@ fn extract_for_naming(cfg: &Config, path: &Path) -> Result<Extracted, String> {
         .map(|s| s.eq_ignore_ascii_case("pdf"))
         .unwrap_or(false);
     if is_pdf && cfg.force_ocr {
-        let text = ocr_pdf(cfg, path)?;
-        let text: String = text.chars().take(MAX_CONTENT_CHARS).collect();
-        if text.trim().is_empty() {
-            return Err("OCR produced no text.".into());
+        match ocr_pdf(cfg, path) {
+            Ok(text) => {
+                let text: String = text.chars().take(MAX_CONTENT_CHARS).collect();
+                if !text.trim().is_empty() {
+                    return Ok(Extracted::Text(text));
+                }
+                // OCR ran but found nothing usable — fall through to
+                // the text layer rather than leaving the user with an
+                // error when readable text exists.
+            }
+            Err(_) => {
+                // Same: OCR unavailable or unusable — fall back to
+                // text extraction instead of erroring out.
+            }
         }
-        return Ok(Extracted::Text(text));
     }
     match extract_content(path) {
         Ok(e) => Ok(e),
