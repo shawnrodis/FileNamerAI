@@ -6,7 +6,7 @@
 
 Right-click any file → **"Rename with File Namer AI"**. **Photos and videos**
 are renamed deterministically from their metadata — no AI needed — using
-BRU-style date names (`MM-DD-YY-HH-MM-SS`). **Documents** get a descriptive
+automatic date-based names (`MM-DD-YY-HH-MM-SS`). **Documents** get a descriptive
 name proposed by a local AI (Ollama). 100% local: no cloud, no API keys,
 no subscriptions.
 
@@ -58,7 +58,7 @@ Supported files:
   truncated to the minute (`:00` seconds), e.g. `01-01-26-15-07-00.mp4`.
   No AI involved.
 
-Name collisions (burst shots sharing a timestamp) get BRU-style `_1`, `_2`
+Name collisions (burst shots sharing a timestamp) get automatic `_1`, `_2`
 suffixes automatically. The earliest timestamp wins when sources disagree,
 since file operations happen at or after capture.
 
@@ -68,14 +68,14 @@ Note: on Windows 11 the menu item lives under "Show more options".
 
 The photo/video naming logic is designed to match
 [Bulk Rename Utility](https://www.bulkrenameutility.co.uk/) using these two
-saved profiles (included in [`bru-profiles/`](bru-profiles/)):
+saved profiles (included in [`bulk-rename-utility-profiles/`](bulk-rename-utility-profiles/)):
 
 - **File Name By Date Taken (Pictures)** — photos with real EXIF Date Taken
   keep full seconds.
 - **File Name By Item Date (Videos & Screenshots)** — videos and photos
   without real EXIF data are truncated to the minute (`:00` seconds).
 
-If you use BRU, these profiles produce identical names to File Namer AI.
+If you use Bulk Rename Utility, these profiles produce identical names to File Namer AI.
 
 ## Build from source
 
