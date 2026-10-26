@@ -31,6 +31,63 @@ const MENU_KEY: &str = r"HKCU\Software\Classes\*\shell\FileNamerAI";
 // config
 // ---------------------------------------------------------------------------
 
+/// Advanced photo/video naming settings. Every default reproduces the
+/// naming logic that shipped before this section existed, so nothing
+/// changes unless the user changes a setting.
+#[derive(Clone)]
+struct PhotoSettings {
+    /// "mm-dd-yy" | "yyyy-mm-dd" | "dd-mm-yy"
+    date_order: String,
+    /// "-" | "_"
+    separator: String,
+    include_time: bool,
+    /// "current" | "always" | "never" (seconds truncation)
+    seconds: String,
+    /// "earliest" | "latest" | "exif_only"
+    source: String,
+    /// "_1" | "-1" | "(1)" (collision suffix style, date names only)
+    collision_suffix: String,
+    prefix: String,
+    suffix_text: String,
+}
+
+impl Default for PhotoSettings {
+    fn default() -> Self {
+        Self {
+            date_order: "mm-dd-yy".into(),
+            separator: "-".into(),
+            include_time: true,
+            seconds: "current".into(),
+            source: "earliest".into(),
+            collision_suffix: "_1".into(),
+            prefix: String::new(),
+            suffix_text: String::new(),
+        }
+    }
+}
+
+impl PhotoSettings {
+    /// Clamp hand-edited / stale ini values back to supported options.
+    fn validated(mut self) -> Self {
+        if !["mm-dd-yy", "yyyy-mm-dd", "dd-mm-yy"].contains(&self.date_order.as_str()) {
+            self.date_order = "mm-dd-yy".into();
+        }
+        if self.separator != "-" && self.separator != "_" {
+            self.separator = "-".into();
+        }
+        if !["current", "always", "never"].contains(&self.seconds.as_str()) {
+            self.seconds = "current".into();
+        }
+        if !["earliest", "latest", "exif_only"].contains(&self.source.as_str()) {
+            self.source = "earliest".into();
+        }
+        if !["_1", "-1", "(1)"].contains(&self.collision_suffix.as_str()) {
+            self.collision_suffix = "_1".into();
+        }
+        self
+    }
+}
+
 #[derive(Clone)]
 struct Config {
     ollama_url: String,
@@ -39,6 +96,7 @@ struct Config {
     append_date: bool,
     never_dates: bool,
     force_ocr: bool,
+    photo: PhotoSettings,
 }
 
 impl Default for Config {
@@ -50,6 +108,7 @@ impl Default for Config {
             append_date: true,
             never_dates: false,
             force_ocr: false,
+            photo: PhotoSettings::default(),
         }
     }
 }
@@ -80,10 +139,19 @@ fn load_config() -> Config {
                 "append_date" => cfg.append_date = v.trim() != "false",
                 "never_dates" => cfg.never_dates = v.trim() == "true",
                 "force_ocr" => cfg.force_ocr = v.trim() == "true",
+                "photo_date_order" => cfg.photo.date_order = v.trim().to_string(),
+                "photo_separator" => cfg.photo.separator = v.trim().to_string(),
+                "photo_include_time" => cfg.photo.include_time = v.trim() != "false",
+                "photo_seconds" => cfg.photo.seconds = v.trim().to_string(),
+                "photo_source" => cfg.photo.source = v.trim().to_string(),
+                "photo_collision_suffix" => cfg.photo.collision_suffix = v.trim().to_string(),
+                "photo_prefix" => cfg.photo.prefix = v.trim().to_string(),
+                "photo_suffix_text" => cfg.photo.suffix_text = v.trim().to_string(),
                 _ => {}
             }
         }
     }
+    cfg.photo = cfg.photo.validated();
     if cfg.ollama_url.is_empty() {
         cfg.ollama_url = DEFAULT_OLLAMA_URL.into();
     }
@@ -98,13 +166,21 @@ fn load_config() -> Config {
 
 fn save_config(cfg: &Config) {
     let s = format!(
-        "ollama_url={}\nmodel={}\nvision_model={}\nappend_date={}\nnever_dates={}\nforce_ocr={}\n",
+        "ollama_url={}\nmodel={}\nvision_model={}\nappend_date={}\nnever_dates={}\nforce_ocr={}\nphoto_date_order={}\nphoto_separator={}\nphoto_include_time={}\nphoto_seconds={}\nphoto_source={}\nphoto_collision_suffix={}\nphoto_prefix={}\nphoto_suffix_text={}\n",
         cfg.ollama_url.trim(),
         cfg.model.trim(),
         cfg.vision_model.trim(),
         cfg.append_date,
         cfg.never_dates,
-        cfg.force_ocr
+        cfg.force_ocr,
+        cfg.photo.date_order,
+        cfg.photo.separator,
+        cfg.photo.include_time,
+        cfg.photo.seconds,
+        cfg.photo.source,
+        cfg.photo.collision_suffix,
+        cfg.photo.prefix,
+        cfg.photo.suffix_text
     );
     let path = config_path();
     if let Some(parent) = path.parent() {
@@ -209,26 +285,29 @@ fn exif_datetime(path: &Path) -> Option<chrono::NaiveDateTime> {
 /// Best available timestamp: EXIF (photos) / embedded media date (videos),
 /// then file Created, then Modified, then now. Returns the source label too.
 ///
-/// The EARLIEST timestamp wins: file operations (copy, rename, edit) happen
-/// at or after capture, so the earliest date is closest to the original.
-fn best_datetime(path: &Path, is_video: bool) -> (chrono::NaiveDateTime, &'static str) {
-    let mut cands: Vec<(chrono::NaiveDateTime, &'static str)> = Vec::new();
-    // Truncation rule (per Shawn 2026-10-22, BRU parity):
-    // - Videos: always truncate to :00 (BRU Item Date).
-    // - Photos with real EXIF: keep full seconds (BRU Date Taken).
-    // - Photos without EXIF (screenshots, Messenger downloads): truncate to :00.
+/// Default selection: the EARLIEST timestamp wins: file operations (copy,
+/// rename, edit) happen at or after capture, so the earliest date is
+/// closest to the original. Advanced settings can switch this to latest,
+/// or to EXIF/media date only (file dates as fallback).
+fn best_datetime_with_settings(
+    path: &Path,
+    is_video: bool,
+    settings: &PhotoSettings,
+) -> (chrono::NaiveDateTime, &'static str) {
+    let mut primary: Vec<(chrono::NaiveDateTime, &'static str)> = Vec::new();
+    // Seconds rule:
+    // - "current" (default, per Shawn 2026-10-22, BRU parity):
+    //   videos always truncate to :00; photos with real EXIF keep full
+    //   seconds; photos without EXIF (screenshots, downloads) truncate.
+    // - "always": truncate every candidate to :00.
+    // - "never": keep full seconds for every candidate.
     // Applied before comparison so priority order is preserved.
-    if is_video {
-        if let Some(dt) = mp4_creation_datetime(path) {
-            cands.push((dt, "video media date"));
-        }
-    } else if let Some(dt) = exif_datetime(path) {
-        cands.push((dt, "EXIF date taken"));
-    }
-    // Only a real DateTimeOriginal (0x9003) exempts a photo from truncation.
-    // Generic EXIF date stamps (0x9004/0x0132) on downloads don't count.
     let has_real_exif = !is_video && has_datetime_original(path);
-    let truncate = is_video || !has_real_exif;
+    let truncate = match settings.seconds.as_str() {
+        "always" => true,
+        "never" => false,
+        _ => is_video || !has_real_exif,
+    };
     let trunc = |dt: chrono::NaiveDateTime| -> chrono::NaiveDateTime {
         if truncate {
             dt.with_second(0)
@@ -238,28 +317,118 @@ fn best_datetime(path: &Path, is_video: bool) -> (chrono::NaiveDateTime, &'stati
             dt
         }
     };
-    for (dt, _) in cands.iter_mut() {
-        *dt = trunc(*dt);
+    if is_video {
+        if let Some(dt) = mp4_creation_datetime(path) {
+            primary.push((trunc(dt), "video media date"));
+        }
+    } else if let Some(dt) = exif_datetime(path) {
+        primary.push((trunc(dt), "EXIF date taken"));
     }
+    let mut file_cands: Vec<(chrono::NaiveDateTime, &'static str)> = Vec::new();
     if let Ok(md) = std::fs::metadata(path) {
         if let Ok(st) = md.created() {
             let dt: chrono::DateTime<chrono::Local> = st.into();
-            cands.push((trunc(dt.naive_local()), "file created date"));
+            file_cands.push((trunc(dt.naive_local()), "file created date"));
         }
         if let Ok(st) = md.modified() {
             let dt: chrono::DateTime<chrono::Local> = st.into();
-            cands.push((trunc(dt.naive_local()), "file modified date"));
+            file_cands.push((trunc(dt.naive_local()), "file modified date"));
         }
     }
-    cands
-        .into_iter()
-        .min_by_key(|(dt, _)| *dt)
-        .unwrap_or_else(|| {
-            (
-                chrono::Local::now().naive_local(),
-                "current time (no date found)",
-            )
-        })
+    // EXIF-only: use the primary date alone when it exists; otherwise
+    // fall back to the file dates (earliest of them) and label that
+    // fallback honestly, so the UI never claims an EXIF date it didn't use.
+    let cands: Vec<(chrono::NaiveDateTime, &'static str)> =
+        if settings.source == "exif_only" {
+            if primary.is_empty() {
+                file_cands.clone()
+            } else {
+                primary
+            }
+        } else {
+            primary.into_iter().chain(file_cands).collect()
+        };
+    if settings.source == "exif_only" && !cands.is_empty() {
+        // Fallback path above already narrowed to file dates; pick earliest
+        // among them regardless of the latest setting elsewhere.
+        // (When a primary date exists, cands has exactly one entry.)
+        if cands.len() > 1 {
+            return cands
+                .into_iter()
+                .min_by_key(|(dt, _)| *dt)
+                .unwrap();
+        }
+        return cands.into_iter().next().unwrap();
+    }
+    if settings.source == "latest" {
+        cands.into_iter().max_by_key(|(dt, _)| *dt)
+    } else {
+        cands.into_iter().min_by_key(|(dt, _)| *dt)
+    }
+    .unwrap_or_else(|| {
+        (
+            chrono::Local::now().naive_local(),
+            "current time (no date found)",
+        )
+    })
+}
+
+/// Single formatting path for photo/video date names, used by BOTH the
+/// single-file and batch DateTime paths so they cannot drift apart.
+/// Default output is exactly MM-DD-YY-HH-MM-SS (prefix/suffix blank).
+/// The separator joins every component, including date-to-time.
+fn format_photo_name(dt: chrono::NaiveDateTime, settings: &PhotoSettings) -> String {
+    let sep = if settings.separator == "_" { "_" } else { "-" };
+    let date = match settings.date_order.as_str() {
+        "yyyy-mm-dd" => format!(
+            "{:04}{}{:02}{}{:02}",
+            dt.year(),
+            sep,
+            dt.month(),
+            sep,
+            dt.day()
+        ),
+        "dd-mm-yy" => format!(
+            "{:02}{}{:02}{}{:02}",
+            dt.day(),
+            sep,
+            dt.month(),
+            sep,
+            dt.year() % 100
+        ),
+        _ => format!(
+            "{:02}{}{:02}{}{:02}",
+            dt.month(),
+            sep,
+            dt.day(),
+            sep,
+            dt.year() % 100
+        ),
+    };
+    let base = if settings.include_time {
+        format!(
+            "{}{}{:02}{}{:02}{}{:02}",
+            date,
+            sep,
+            dt.hour(),
+            sep,
+            dt.minute(),
+            sep,
+            dt.second()
+        )
+    } else {
+        date
+    };
+    format!("{}{}{}", settings.prefix, base, settings.suffix_text)
+}
+
+/// Collision suffix for date names only (AI document names keep "_1").
+fn collision_name(stem: &str, n: u32, style: &str) -> String {
+    match style {
+        "-1" => format!("{stem}-{n}"),
+        "(1)" => format!("{stem} ({n})"),
+        _ => format!("{stem}_{n}"),
+    }
 }
 
 /// Iterate MP4 boxes: returns (type, content_start, next_pos).
@@ -538,7 +707,17 @@ fn pptx_text(path: &Path) -> String {
 
 /// Best available timestamp: EXIF (photos) / embedded media date (videos),
 /// then file Created, then Modified, then now.
+// Default-settings entry point, used by tests; production paths go
+// through extract_content_with_config with the user's settings.
+#[allow(dead_code)]
 fn extract_content(path: &Path) -> Result<Extracted, String> {
+    extract_content_with_config(path, &PhotoSettings::default())
+}
+
+fn extract_content_with_config(
+    path: &Path,
+    settings: &PhotoSettings,
+) -> Result<Extracted, String> {
     let ext = path
         .extension()
         .and_then(|s| s.to_str())
@@ -602,12 +781,12 @@ fn extract_content(path: &Path) -> Result<Extracted, String> {
         }
         "jpg" | "jpeg" | "png" | "tif" | "tiff" | "webp" | "heic" | "heif" => {
             // Photos: EXIF "Date Taken", else file dates. No AI.
-            let (dt, src) = best_datetime(path, false);
+            let (dt, src) = best_datetime_with_settings(path, false, settings);
             Ok(Extracted::DateTime(dt, src))
         }
         "mp4" | "mov" | "m4v" | "3gp" | "avi" | "mkv" | "webm" => {
             // Videos: embedded media-created date, else file dates. No AI.
-            let (dt, src) = best_datetime(path, true);
+            let (dt, src) = best_datetime_with_settings(path, true, settings);
             Ok(Extracted::DateTime(dt, src))
         }
         _ => {
@@ -623,7 +802,7 @@ fn extract_content(path: &Path) -> Result<Extracted, String> {
                     return Ok(Extracted::Text(text));
                 }
             }
-            let (dt, src) = best_datetime(path, false);
+            let (dt, src) = best_datetime_with_settings(path, false, settings);
             Ok(Extracted::DateTime(dt, src))
         }
     }
@@ -1572,26 +1751,57 @@ fn strip_partial_date(s: &str) -> Option<&str> {
     }
 }
 
-/// "T_1" -> "T"; "T" -> "T". Used so a BRU-style collision suffix doesn't
-/// stop us recognizing an already-correctly-named file.
-fn strip_numeric_suffix(stem: &str) -> &str {
-    if let Some(i) = stem.rfind('_') {
+/// "T_1" / "T-1" / "T (1)" -> "T" (for the given style); "T" -> "T".
+/// Used so a collision suffix doesn't stop us recognizing an
+/// already-correctly-named file. The legacy "_1" form is always also
+/// recognised, so files named under the old default still match after
+/// a style switch. Note the "-" form is ambiguous with "-" date
+/// separators (a plain "10-26-26" date ends in "-26"); that is safe in
+/// practice because no-op detection first checks exact equality, and
+/// suffix stripping only matters for names already carrying a suffix.
+fn strip_numeric_suffix<'a>(stem: &'a str, style: &str) -> &'a str {
+    fn strip_sep<'a>(stem: &'a str, sep: char) -> Option<&'a str> {
+        let i = stem.rfind(sep)?;
         let (base, suffix) = stem.split_at(i);
         let digits = &suffix[1..];
         if !base.is_empty() && !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
+            Some(base)
+        } else {
+            None
+        }
+    }
+    if style == "(1)" && stem.ends_with(')') {
+        if let Some(i) = stem.rfind(" (") {
+            let digits = &stem[i + 2..stem.len() - 1];
+            if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
+                return &stem[..i];
+            }
+        }
+    } else if style == "-1" {
+        if let Some(base) = strip_sep(stem, '-') {
             return base;
         }
+    }
+    // Default style, and legacy fallback for every style.
+    if let Some(base) = strip_sep(stem, '_') {
+        return base;
     }
     stem
 }
 
 /// If "stem.ext" already exists next to the file, return "stem_1",
-/// "stem_2", ... (BRU-style: collisions get _1, _2). The file's own current
-/// name is never treated as a collision — including when it carries a _N
-/// suffix from an earlier batch (already correctly named -> keep as-is).
+/// "stem_2", ... (default style). The file's own current name is never
+/// treated as a collision — including when it carries a _N suffix from
+/// an earlier batch (already correctly named -> keep as-is).
 fn unique_stem(path: &Path, stem: &str, ext: &str) -> String {
+    unique_stem_with_style(path, stem, ext, "_1")
+}
+
+/// Same as unique_stem, but with the advanced photo/video collision
+/// suffix style. Only date names use this; AI document names keep "_1".
+fn unique_stem_with_style(path: &Path, stem: &str, ext: &str, style: &str) -> String {
     if let Some(cur) = path.file_stem().and_then(|s| s.to_str()) {
-        if cur == stem || strip_numeric_suffix(cur) == stem {
+        if cur == stem || strip_numeric_suffix(cur, style) == stem {
             return cur.to_string();
         }
     }
@@ -1610,7 +1820,7 @@ fn unique_stem(path: &Path, stem: &str, ext: &str) -> String {
         return stem.to_string();
     }
     for n in 1..1000 {
-        let s = format!("{stem}_{n}");
+        let s = collision_name(stem, n, style);
         if ok(&s) {
             return s;
         }
@@ -1649,6 +1859,7 @@ struct NamerApp {
     append_date: bool,
     never_dates: bool,
     force_ocr: bool,
+    photo_edit: PhotoSettings,
     settings_status: String,
     drop_status: String,
     menu_on: bool,
@@ -1708,7 +1919,7 @@ fn extract_for_naming(cfg: &Config, path: &Path) -> Result<Extracted, String> {
             }
         }
     }
-    match extract_content(path) {
+    match extract_content_with_config(path, &cfg.photo) {
         Ok(e) => Ok(e),
         Err(e) if is_pdf && e.contains("no readable text") => {
             match ocr_pdf(cfg, path) {
@@ -1740,9 +1951,10 @@ fn rename_worker(path: PathBuf, cfg: Config, tx: mpsc::Sender<WorkerMsg>, attemp
     };
     match extracted {
         Extracted::DateTime(dt, src) => {
-            // BRU-style: MM-DD-YY-HH-MM-SS, straight to the confirm dialog. No AI.
+            // Date-based name via the single shared formatter, straight
+            // to the confirm dialog. No AI.
             send(WorkerMsg::DateOnly(
-                dt.format("%m-%d-%y-%H-%M-%S").to_string(),
+                format_photo_name(dt, &cfg.photo),
                 src.to_string(),
             ));
         }
@@ -1776,7 +1988,7 @@ fn batch_worker(idx: usize, path: PathBuf, cfg: Config, tx: mpsc::Sender<BatchMs
     let result: Result<BatchProposal, String> = (|| {
         match extract_for_naming(&cfg, &path)? {
             Extracted::DateTime(dt, src) => Ok(BatchProposal {
-                stem: sanitize_filename(&dt.format("%m-%d-%y-%H-%M-%S").to_string()),
+                stem: sanitize_filename(&format_photo_name(dt, &cfg.photo)),
                 date_source: Some(src.to_string()),
             }),
             Extracted::Text(content) => {
@@ -1817,7 +2029,7 @@ enum RowStatus {
 /// BRU-style batch collision resolution: every file that would share a name
 /// (with another selected file or an existing disk file) gets _1, _2, ...
 /// Files already correctly named are left alone and hold their names.
-fn resolve_batch(rows: &[BatchRow]) -> Vec<RowStatus> {
+fn resolve_batch(rows: &[BatchRow], photo_collision_suffix: &str) -> Vec<RowStatus> {
     use std::collections::{HashMap, HashSet};
 
     let mut out: Vec<RowStatus> = vec![RowStatus::Working; rows.len()];
@@ -1878,7 +2090,12 @@ fn resolve_batch(rows: &[BatchRow]) -> Vec<RowStatus> {
                 .unwrap_or(&r.current_name);
             let s_low = s.to_lowercase();
             let cur_low = cur_stem.to_lowercase();
-            let noop = s_low == cur_low || s_low == strip_numeric_suffix(&cur_low);
+            let style = if r.date_source.is_some() {
+                photo_collision_suffix
+            } else {
+                "_1"
+            };
+            let noop = s_low == cur_low || s_low == strip_numeric_suffix(&cur_low, style);
             is_noop.insert(i, noop);
             if noop {
                 out[i] = RowStatus::NoOp;
@@ -1919,8 +2136,15 @@ fn resolve_batch(rows: &[BatchRow]) -> Vec<RowStatus> {
             } else {
                 let mut n = 1u32;
                 for &idx in &members {
+                    // Date rows use the advanced collision style;
+                    // document rows keep the default "_1" style.
+                    let style = if rows[idx].date_source.is_some() {
+                        photo_collision_suffix
+                    } else {
+                        "_1"
+                    };
                     loop {
-                        let cand = format!("{stem}_{n}");
+                        let cand = collision_name(&stem, n, style);
                         if n > 9999 {
                             break;
                         }
@@ -1968,6 +2192,7 @@ impl NamerApp {
             force_ocr: cfg.force_ocr,
             append_date: cfg.append_date,
             never_dates: cfg.never_dates,
+            photo_edit: cfg.photo.clone(),
             cfg,
             settings_status: String::new(),
             drop_status: String::new(),
@@ -2032,7 +2257,12 @@ impl NamerApp {
             Some(WorkerMsg::DateOnly(name, src)) => {
                 let stem = sanitize_filename(&name);
                 self.suggestion = match &self.file_path {
-                    Some(p) => unique_stem(p, &stem, &self.file_ext.clone()),
+                    Some(p) => unique_stem_with_style(
+                        p,
+                        &stem,
+                        &self.file_ext.clone(),
+                        &self.cfg.photo.collision_suffix.clone(),
+                    ),
                     None => stem,
                 };
                 self.date_source = Some(src);
@@ -2072,7 +2302,19 @@ impl NamerApp {
             self.state = RenameState::Error("The name is empty.".into());
             return;
         }
-        let stem = unique_stem(&path, &stem, &self.file_ext);
+        // Date names keep the advanced collision style on this final
+        // pass too (a collision could appear after the dialog opened);
+        // AI document names keep the default "_1" style.
+        let stem = if self.date_source.is_some() {
+            unique_stem_with_style(
+                &path,
+                &stem,
+                &self.file_ext,
+                &self.cfg.photo.collision_suffix.clone(),
+            )
+        } else {
+            unique_stem(&path, &stem, &self.file_ext)
+        };
         let new_name = if self.file_ext.is_empty() {
             stem.clone()
         } else {
@@ -2100,6 +2342,8 @@ impl NamerApp {
         self.cfg.append_date = self.append_date;
         self.cfg.never_dates = self.never_dates;
         self.cfg.force_ocr = self.force_ocr;
+        self.cfg.photo = self.photo_edit.clone().validated();
+        self.photo_edit = self.cfg.photo.clone();
         save_config(&self.cfg);
     }
 
@@ -2641,13 +2885,93 @@ impl NamerApp {
         }
 
         ui.add_space(8.0);
+        ui.collapsing("Advanced photo/video naming", |ui| {
+            ui.label("These change how photos and videos are named. Defaults reproduce the current logic — change nothing and nothing changes. Save settings (above) or Reset to defaults saves these too.");
+            egui::ComboBox::from_label("Date format")
+                .selected_text(match self.photo_edit.date_order.as_str() {
+                    "yyyy-mm-dd" => "YYYY-MM-DD",
+                    "dd-mm-yy" => "DD-MM-YY",
+                    _ => "MM-DD-YY",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.photo_edit.date_order, "mm-dd-yy".to_string(), "MM-DD-YY");
+                    ui.selectable_value(&mut self.photo_edit.date_order, "yyyy-mm-dd".to_string(), "YYYY-MM-DD");
+                    ui.selectable_value(&mut self.photo_edit.date_order, "dd-mm-yy".to_string(), "DD-MM-YY");
+                });
+            egui::ComboBox::from_label("Separator")
+                .selected_text(self.photo_edit.separator.clone())
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.photo_edit.separator, "-".to_string(), "-");
+                    ui.selectable_value(&mut self.photo_edit.separator, "_".to_string(), "_");
+                });
+            ui.checkbox(&mut self.photo_edit.include_time, "Include time (off = date only)");
+            egui::ComboBox::from_label("Seconds")
+                .selected_text(match self.photo_edit.seconds.as_str() {
+                    "always" => "Always truncate to :00",
+                    "never" => "Never truncate",
+                    _ => "Current rule",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.photo_edit.seconds, "current".to_string(), "Current rule (videos :00; photos without real Date Taken :00; photos with it keep seconds)");
+                    ui.selectable_value(&mut self.photo_edit.seconds, "always".to_string(), "Always truncate to :00");
+                    ui.selectable_value(&mut self.photo_edit.seconds, "never".to_string(), "Never truncate");
+                });
+            egui::ComboBox::from_label("Which date wins")
+                .selected_text(match self.photo_edit.source.as_str() {
+                    "latest" => "Latest wins",
+                    "exif_only" => "EXIF/media date only (file dates as fallback)",
+                    _ => "Earliest wins",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.photo_edit.source, "earliest".to_string(), "Earliest wins (EXIF/media date, file Created, file Modified)");
+                    ui.selectable_value(&mut self.photo_edit.source, "latest".to_string(), "Latest wins");
+                    ui.selectable_value(&mut self.photo_edit.source, "exif_only".to_string(), "EXIF/media date only (file dates as fallback)");
+                });
+            egui::ComboBox::from_label("Collision suffix (date names only)")
+                .selected_text(self.photo_edit.collision_suffix.clone())
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.photo_edit.collision_suffix, "_1".to_string(), "_1");
+                    ui.selectable_value(&mut self.photo_edit.collision_suffix, "-1".to_string(), "-1");
+                    ui.selectable_value(&mut self.photo_edit.collision_suffix, "(1)".to_string(), "(1)");
+                });
+            ui.horizontal(|ui| {
+                ui.label("Prefix:");
+                ui.add(egui::TextEdit::singleline(&mut self.photo_edit.prefix).desired_width(160.0));
+            });
+            ui.horizontal(|ui| {
+                ui.label("Suffix:");
+                ui.add(egui::TextEdit::singleline(&mut self.photo_edit.suffix_text).desired_width(160.0));
+            });
+            // Live preview on a sample date, so the effect is visible
+            // before any file is renamed.
+            let preview_settings = self.photo_edit.clone().validated();
+            let sample = chrono::NaiveDate::from_ymd_opt(2026, 10, 26)
+                .and_then(|d| d.and_hms_opt(14, 30, 45))
+                .unwrap_or_else(|| chrono::Local::now().naive_local());
+            ui.label(format!(
+                "Preview: {}",
+                format_photo_name(sample, &preview_settings)
+            ));
+            if ui.button("Reset to defaults").clicked() {
+                self.photo_edit = PhotoSettings::default();
+                self.save_settings_from_ui();
+                self.settings_status = "Photo/video naming reset to defaults.".into();
+            }
+            if !self.settings_status.is_empty() {
+                ui.label(&self.settings_status);
+            }
+            ui.label("Note: Save settings (in Local AI above) also saves these. The collision suffix only affects date names — AI document names still use _1.");
+        });
+
+        ui.add_space(8.0);
         ui.collapsing("How photo and video dating works", |ui| {
             ui.label("Photos and videos are named from dates — no AI involved.");
-            ui.label("• Photos with a real Date Taken in EXIF keep full seconds (MM-DD-YY-HH-MM-SS).");
-            ui.label("• Photos without real Date Taken (screenshots, chat downloads) are truncated to the minute (:00 seconds).");
-            ui.label("• Videos use the embedded media-created date, always truncated to the minute (:00).");
-            ui.label("• If the dates disagree, the earliest one wins (EXIF/media date, file Created, file Modified).");
-            ui.label("• Two files sharing a timestamp get _1, _2 suffixes; already-correct names are left alone.");
+            ui.label("• By default, photos with a real Date Taken in EXIF keep full seconds (MM-DD-YY-HH-MM-SS).");
+            ui.label("• By default, photos without real Date Taken (screenshots, chat downloads) are truncated to the minute (:00 seconds).");
+            ui.label("• By default, videos use the embedded media-created date, always truncated to the minute (:00).");
+            ui.label("• By default, if the dates disagree, the earliest one wins (EXIF/media date, file Created, file Modified).");
+            ui.label("• Two files sharing a timestamp get a collision suffix (_1, _2 by default); already-correct names are left alone.");
+            ui.label("• The Advanced photo/video naming section above can change any of these defaults.");
         });
 
         ui.add_space(8.0);
@@ -2848,6 +3172,7 @@ struct BatchApp {
     rx: mpsc::Receiver<BatchMsg>,
     statuses: Vec<RowStatus>,
     finished: bool,
+    photo_collision_suffix: String,
 }
 
 impl BatchApp {
@@ -2893,16 +3218,18 @@ impl BatchApp {
             thread::spawn(move || batch_worker(i, path, cfg, tx));
         }
         let statuses = vec![RowStatus::Working; rows.len()];
+        let photo_collision_suffix = cfg.photo.collision_suffix.clone();
         Self {
             rows,
             rx,
             statuses,
             finished: false,
+            photo_collision_suffix,
         }
     }
 
     fn re_resolve(&mut self) {
-        self.statuses = resolve_batch(&self.rows);
+        self.statuses = resolve_batch(&self.rows, &self.photo_collision_suffix.clone());
     }
 
     fn poll_workers(&mut self, ctx: &egui::Context) {
@@ -3276,6 +3603,46 @@ mod tests {
              _ => panic!("expected Text extraction"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn photo_format_default_matches_current_logic() {
+        let dt = chrono::NaiveDate::from_ymd_opt(2026, 10, 26)
+            .unwrap()
+            .and_hms_opt(14, 30, 45)
+            .unwrap();
+        assert_eq!(
+            format_photo_name(dt, &PhotoSettings::default()),
+            "10-26-26-14-30-45"
+        );
+    }
+
+    #[test]
+    fn photo_format_changed_order_separator_and_prefix_suffix() {
+        let dt = chrono::NaiveDate::from_ymd_opt(2026, 10, 26)
+            .unwrap()
+            .and_hms_opt(14, 30, 45)
+            .unwrap();
+        let mut s = PhotoSettings::default();
+        s.date_order = "yyyy-mm-dd".into();
+        s.separator = "_".into();
+        s.include_time = false;
+        s.prefix = "IMG_".into();
+        s.suffix_text = "_edited".into();
+        assert_eq!(format_photo_name(dt, &s), "IMG_2026_10_26_edited");
+    }
+
+    #[test]
+    fn photo_collision_styles_and_stripping() {
+        assert_eq!(collision_name("10-26-26", 1, "_1"), "10-26-26_1");
+        assert_eq!(collision_name("10-26-26", 2, "-1"), "10-26-26-2");
+        assert_eq!(collision_name("10-26-26", 3, "(1)"), "10-26-26 (3)");
+        assert_eq!(strip_numeric_suffix("10-26-26_1", "_1"), "10-26-26");
+        assert_eq!(strip_numeric_suffix("10-26-26-1", "-1"), "10-26-26");
+        assert_eq!(strip_numeric_suffix("10-26-26 (1)", "(1)"), "10-26-26");
+        // Legacy "_1" is recognised under any style.
+        assert_eq!(strip_numeric_suffix("10-26-26_1", "-1"), "10-26-26");
+        assert_eq!(strip_numeric_suffix("10-26-26", "_1"), "10-26-26");
     }
 
     #[test]
