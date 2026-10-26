@@ -375,7 +375,7 @@ fn ollama_up(url: &str) -> bool {
 
 fn build_prompt(original: &str, content: &str, append_date: bool, attempt: u32) -> String {
     let date_rule = if append_date {
-        "- If the content contains an obvious document date (invoice date, letter date, statement date), append it after an underscore as _DD-Mon-YYYY with the month capitalized, e.g. Saw Palmetto Price Comparison_28-May-2023.\n\
+        "- If the content contains an obvious document date (invoice date, letter date, statement date), append it after an underscore as _DD-Mon-YYYY with the month capitalized, e.g. Example Document Title_28-May-2023.\n\
          - Never invent, guess, or approximate a date. If no date appears in the content, output the name with no date at all.\n"
     } else {
         ""
@@ -390,7 +390,8 @@ fn build_prompt(original: &str, content: &str, append_date: bool, attempt: u32) 
          \n\
          Rules (follow exactly):\n\
          - Output ONLY the filename: no quotes, no explanation, no file extension.\n\
-         - Use spaces between words with normal Title Case (e.g. Saw Palmetto Price Comparison). Never ALL CAPS.\n\
+         - Use spaces between words with normal Title Case (e.g. Example Document Title). Never ALL CAPS.\n\
+         - The title must use ONLY words that appear in the document content below. Never invent a title or borrow words from these instructions.\n\
          - Maximum 50 characters.\n\
          {date_rule}\
          {retry_rule}\
@@ -488,6 +489,14 @@ fn ask_ollama(cfg: &Config, path: &Path, content: &str, attempt: u32) -> Result<
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
+    // Verify the title itself, not just the date: the model must not
+    // invent a title (or parrot the prompt's example). If the title's
+    // words aren't in the document, reject so the user can re-roll.
+    if !title_in_content(&stem, content) {
+        return Err(format!(
+            "The model proposed a title that doesn't match the document content (\"{stem}\") — click \"New name\" to try again."
+        ));
+    }
     // Verify any date the model added: it must actually appear in the content.
     // If not — or if the user disabled dates entirely — strip it.
     // Otherwise normalize it to Shawn's format (28-Mar-2012).
@@ -576,16 +585,28 @@ fn uninstall_menu() -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
-// auto update check (GitHub Releases)
+// auto update (Tuya-style: download installer + run it, no browser)
 // ---------------------------------------------------------------------------
 
 const UPDATE_REPO: &str = "shawnrodis/FileNamerAI";
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// A release asset this app installs from.
+#[derive(Clone)]
+struct ReleaseInfo {
+    version: String,    // e.g. "1.3.8" (tag without the 'v')
+    asset_name: String, // e.g. "FileNamerAI-Setup-v1.3.8.exe"
+    asset_url: String,  // browser_download_url
+    asset_size: u64,
+}
+
 enum UpdateMsg {
-    Available(String, String), // (version tag, release url)
+    Available(ReleaseInfo),
     UpToDate,
     CheckFailed,
+    DownloadProgress(u64, u64), // (bytes got, total)
+    Downloaded(std::path::PathBuf),
+    DownloadFailed,
 }
 
 fn parse_ver(s: &str) -> (u64, u64, u64) {
@@ -635,23 +656,105 @@ fn check_updates(tx: mpsc::Sender<UpdateMsg>) {
         }
     };
     let tag = v["tag_name"].as_str().unwrap_or("").to_string();
-    let url = v["html_url"].as_str().unwrap_or("").to_string();
-    if tag.is_empty() || url.is_empty() {
+    if tag.is_empty() {
         send(UpdateMsg::CheckFailed);
         return;
     }
-    if parse_ver(&tag) > parse_ver(APP_VERSION) {
-        send(UpdateMsg::Available(tag, url));
-    } else {
+    if parse_ver(&tag) <= parse_ver(APP_VERSION) {
         send(UpdateMsg::UpToDate);
+        return;
+    }
+    // Newer version — find this platform's installer asset by exact name.
+    let version = tag.trim_start_matches('v').to_string();
+    let want = format!("FileNamerAI-Setup-v{version}.exe");
+    let assets = v["assets"].as_array().cloned().unwrap_or_default();
+    let asset = assets.iter().find(|a| {
+        a.get("name")
+            .and_then(|n| n.as_str())
+            .map(|n| n == want)
+            .unwrap_or(false)
+    });
+    match asset {
+        Some(a) => {
+            let url = a
+                .get("browser_download_url")
+                .and_then(|u| u.as_str())
+                .unwrap_or("")
+                .to_string();
+            let size = a.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
+            if url.is_empty() {
+                send(UpdateMsg::CheckFailed);
+            } else {
+                send(UpdateMsg::Available(ReleaseInfo {
+                    version,
+                    asset_name: want,
+                    asset_url: url,
+                    asset_size: size,
+                }));
+            }
+        }
+        None => send(UpdateMsg::CheckFailed),
     }
 }
 
-fn open_url(url: &str) {
-    let _ = Command::new("cmd")
-        .args(["/c", "start", "", url])
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn();
+/// Download the installer to %TEMP%, reporting progress. Verifies the
+/// file exists and is non-empty before reporting success.
+fn download_update(info: ReleaseInfo, tx: mpsc::Sender<UpdateMsg>) {
+    let send = |m| {
+        let _ = tx.send(m);
+    };
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .user_agent("FileNamerAI-update-download")
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => {
+            send(UpdateMsg::DownloadFailed);
+            return;
+        }
+    };
+    let mut resp = match client.get(&info.asset_url).send() {
+        Ok(r) if r.status().is_success() => r,
+        _ => {
+            send(UpdateMsg::DownloadFailed);
+            return;
+        }
+    };
+    let total = resp.content_length().unwrap_or(info.asset_size);
+    let dest = std::env::temp_dir().join(&info.asset_name);
+    let mut file = match std::fs::File::create(&dest) {
+        Ok(f) => f,
+        Err(_) => {
+            send(UpdateMsg::DownloadFailed);
+            return;
+        }
+    };
+    let mut got: u64 = 0;
+    let mut buf = [0u8; 8192];
+    use std::io::Read;
+    use std::io::Write;
+    loop {
+        match resp.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if file.write_all(&buf[..n]).is_err() {
+                    send(UpdateMsg::DownloadFailed);
+                    return;
+                }
+                got += n as u64;
+                let _ = tx.send(UpdateMsg::DownloadProgress(got, total));
+            }
+            Err(_) => {
+                send(UpdateMsg::DownloadFailed);
+                return;
+            }
+        }
+    }
+    match std::fs::metadata(&dest) {
+        Ok(m) if m.len() > 0 => send(UpdateMsg::Downloaded(dest)),
+        _ => send(UpdateMsg::DownloadFailed),
+    }
 }
 
 const MONTHS_FULL: [&str; 12] = [
@@ -757,6 +860,35 @@ fn date_in_content(content: &str, day: u32, mon: u32, year: i32) -> bool {
         format!("{day:02}.{mon:02}.{year}"),
     ];
     cands.iter().any(|c| lower.contains(c.as_str()))
+}
+
+/// True when the proposed title actually comes from the document.
+/// Guards against the model hallucinating a title (or parroting the
+/// prompt's example) instead of reading the content: at least half
+/// of the title's significant words must appear in the content.
+/// Stop words and very short tokens are skipped; matching is
+/// case-insensitive substring, so "Confirmation" matches
+/// "confirmations" and "Opt-Out" matches "opt-out".
+fn title_in_content(stem: &str, content: &str) -> bool {
+    const STOP: &[&str] = &[
+        "the", "a", "an", "and", "or", "of", "for", "to", "in", "on", "at", "by", "with",
+        "from", "is", "are", "was", "were", "be", "been",
+    ];
+    let lower = content.to_lowercase();
+    let words: Vec<&str> = stem
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() >= 3)
+        .filter(|w| !STOP.contains(&w.to_lowercase().as_str()))
+        .collect();
+    if words.is_empty() {
+        return true; // nothing checkable — don't block on it
+    }
+    let found = words
+        .iter()
+        .filter(|w| lower.contains(&w.to_lowercase()))
+        .count();
+    // At least half the significant words must be in the document.
+    found * 2 >= words.len()
 }
 
 /// If the name is SHOUTING (all caps), convert to Title Case.
@@ -886,10 +1018,12 @@ struct NamerApp {
     show_about: bool,
     // update check
     update_rx: Option<mpsc::Receiver<UpdateMsg>>,
-    update_info: Option<(String, String)>,
+    update_info: Option<ReleaseInfo>,
     update_dismissed: bool,
     update_status: String,
     update_pending: bool,
+    update_downloading: bool,
+    update_progress: (u64, u64),
 }
 
 fn rename_worker(path: PathBuf, cfg: Config, tx: mpsc::Sender<WorkerMsg>, attempt: u32) {
@@ -1145,6 +1279,8 @@ impl NamerApp {
             update_dismissed: false,
             update_status: String::new(),
             update_pending: false,
+            update_downloading: false,
+            update_progress: (0, 0),
         };
 
         if !app.is_rename_mode {
@@ -1262,11 +1398,12 @@ impl NamerApp {
             }
         }
         match got {
-            Some(UpdateMsg::Available(tag, url)) => {
-                self.update_info = Some((tag, url));
+            Some(UpdateMsg::Available(info)) => {
+                self.update_info = Some(info);
                 self.update_dismissed = false;
                 self.update_status.clear();
                 self.update_pending = false;
+                self.update_downloading = false;
             }
             Some(UpdateMsg::UpToDate) => {
                 self.update_info = None;
@@ -1281,6 +1418,29 @@ impl NamerApp {
                         "Couldn't reach GitHub — check your connection and try again.".into();
                 }
             }
+            Some(UpdateMsg::DownloadProgress(got_bytes, total)) => {
+                self.update_progress = (got_bytes, total);
+                ctx.request_repaint();
+            }
+            Some(UpdateMsg::Downloaded(path)) => {
+                self.update_downloading = false;
+                self.update_status = format!(
+                    "Downloaded {} — launching installer…",
+                    path.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default()
+                );
+                // Run the installer, then exit so it can replace us.
+                let _ = Command::new(&path)
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .spawn();
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                std::process::exit(0);
+            }
+            Some(UpdateMsg::DownloadFailed) => {
+                self.update_downloading = false;
+                self.update_status = "Download failed — check your connection and try again.".into();
+            }
             None => {}
         }
     }
@@ -1292,16 +1452,39 @@ impl NamerApp {
 
         // update banner
         let upd = self.update_info.clone();
-        if let Some((ver, url)) = upd {
+        if let Some(info) = upd {
             if !self.update_dismissed {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new(format!("Update available: {ver} (you have v{APP_VERSION})"))
-                            .strong(),
+                        egui::RichText::new(format!(
+                            "Update available: v{} (you have v{APP_VERSION})",
+                            info.version
+                        ))
+                        .strong(),
                     );
-                    if ui.button("Download").clicked() {
-                        open_url(&url);
+                    if self.update_downloading {
+                        let (got_b, total_b) = self.update_progress;
+                        let pct = if total_b > 0 {
+                            got_b as f32 / total_b as f32 * 100.0
+                        } else {
+                            0.0
+                        };
+                        ui.label(format!(
+                            "Downloading… {:.0}% ({:.1} / {:.1} MB)",
+                            pct,
+                            got_b as f32 / 1_048_576.0,
+                            total_b as f32 / 1_048_576.0
+                        ));
+                    } else if ui.button("Download & Install").clicked() {
+                        // Tuya-style: download the installer, run
+                        // it, exit so it can replace us.
+                        self.update_downloading = true;
+                        self.update_progress = (0, info.asset_size);
+                        let (tx2, rx2) = mpsc::channel();
+                        self.update_rx = Some(rx2);
+                        let info2 = info.clone();
+                        thread::spawn(move || download_update(info2, tx2));
                     }
                     if ui.button("Dismiss").clicked() {
                         self.update_dismissed = true;
