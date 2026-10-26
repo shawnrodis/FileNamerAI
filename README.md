@@ -17,13 +17,13 @@ Distributed as an installer, no console window. Runs as a normal user
 ## Screenshot
 
 <p align="center">
-  <img src="assets/screenshot.png" alt="The File Namer AI settings window: update check, Ollama connection, in-app model downloads, and naming options" width="520">
-  <br><em>The settings window — updates at the top, models downloadable in-app, done.</em>
+  <img src="assets/screenshot.png" alt="The File Namer AI settings window on Windows (v1.3.19): update check, Ollama connection, in-app model downloads, and right-click menu" width="520">
+  <br><em>The settings window on Windows (v1.3.19) — updates at the top, models downloadable in-app, right-click menu installed.</em>
 </p>
 
 <p align="center">
-  <img src="assets/screenshot-v1.3.19.png" alt="The File Namer AI settings window (v1.3.19): update check, Ollama connection, in-app model downloads, and the advanced photo/video naming section" width="520">
-  <br><em>The settings window (v1.3.19) — with the advanced photo/video naming section expanded.</em>
+  <img src="assets/screenshot-v1.3.19.png" alt="The File Namer AI settings window on Mac (v1.3.19): update check, Ollama connection, in-app model downloads, and the advanced photo/video naming section" width="520">
+  <br><em>The settings window on Mac (v1.3.19) — with the advanced photo/video naming section expanded.</em>
 </p>
 
 ## Download
