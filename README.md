@@ -23,11 +23,26 @@ Distributed as an installer, no console window. Runs as a normal user
 
 ## Download
 
-Grab the latest `FileNamerAI-Setup-vX.Y.Z.exe` installer from
-[Releases](https://github.com/shawnrodis/FileNamerAI/releases) and run it —
-per-user install, no admin rights needed. It places the app in
-`%LOCALAPPDATA%\FileNamerAI`, registers the right-click menu, and adds an
-uninstaller. (Building from source is optional; instructions below.)
+Grab the latest release from
+[Releases](https://github.com/shawnrodis/FileNamerAI/releases) — one
+version, both platforms:
+
+- **Windows:** `FileNamerAI-Setup-vX.Y.Z.exe` installer — per-user
+  install, no admin rights needed. It places the app in
+  `%LOCALAPPDATA%\FileNamerAI`, registers the right-click menu, and adds
+  an uninstaller.
+- **Mac:** `FileNamerAI-vX.Y.Z.dmg` (universal: Apple Silicon + Intel) —
+  open it, drag File Namer AI to Applications. (Building from source is
+  optional; instructions below.)
+
+  **First launch (unsigned app):** the DMG is unsigned (no Apple Developer
+  certificate), so macOS refuses the first double-click and offers to move
+  it to Trash — don't. Instead open **System Settings → Privacy &
+  Security**, scroll to the Security section, and click **Open Anyway**
+  next to the app, then authenticate (Touch ID or password) and confirm
+  **Open**. After that it opens normally. (Terminal alternative, before
+  first launch: `xattr -dr com.apple.quarantine /Applications/FileNamerAI.app`;
+  on older macOS versions, right-click → Open does the same job.)
 
 ## How it works
 
@@ -94,6 +109,18 @@ rustup target add x86_64-pc-windows-gnu
 #   sudo ln -s /usr/bin/x86_64-w64-mingw32-windres /usr/local/bin/windres
 cargo build --release --target x86_64-pc-windows-gnu
 ```
+
+On a Mac (install Rust via [rustup](https://rustup.rs/) first):
+
+```bash
+cargo build --release
+```
+
+The Mac DMG is built by GitHub Actions (see `MAC_BUILD.md`) — the
+workflow builds both Apple architectures, lipos them into one universal
+binary, and uploads the DMG to the same release as the Windows installer.
+Cross-checking macOS from Linux doesn't work: the `ring` C dependency
+passes macOS-only compiler flags that Linux `cc` rejects.
 
 The build script compiles `assets/FileNamerAI.rc` with windres and links the
 resulting object directly, embedding the exe icon and the application manifest.
