@@ -16,6 +16,7 @@ use std::time::Duration;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
 const DEFAULT_MODEL: &str = "qwen2.5:3b";
+const DEFAULT_VISION_MODEL: &str = "moondream";
 const MAX_CONTENT_CHARS: usize = 4000;
 const MENU_KEY: &str = r"HKCU\Software\Classes\*\shell\FileNamerAI";
 
@@ -27,8 +28,10 @@ const MENU_KEY: &str = r"HKCU\Software\Classes\*\shell\FileNamerAI";
 struct Config {
     ollama_url: String,
     model: String,
+    vision_model: String,
     append_date: bool,
     never_dates: bool,
+    force_ocr: bool,
 }
 
 impl Default for Config {
@@ -36,8 +39,10 @@ impl Default for Config {
         Self {
             ollama_url: DEFAULT_OLLAMA_URL.into(),
             model: DEFAULT_MODEL.into(),
+            vision_model: DEFAULT_VISION_MODEL.into(),
             append_date: true,
             never_dates: false,
+            force_ocr: false,
         }
     }
 }
@@ -56,8 +61,10 @@ fn load_config() -> Config {
             match k.trim() {
                 "ollama_url" => cfg.ollama_url = v.trim().to_string(),
                 "model" => cfg.model = v.trim().to_string(),
+                "vision_model" => cfg.vision_model = v.trim().to_string(),
                 "append_date" => cfg.append_date = v.trim() != "false",
                 "never_dates" => cfg.never_dates = v.trim() == "true",
+                "force_ocr" => cfg.force_ocr = v.trim() == "true",
                 _ => {}
             }
         }
@@ -68,16 +75,21 @@ fn load_config() -> Config {
     if cfg.model.is_empty() {
         cfg.model = DEFAULT_MODEL.into();
     }
+    if cfg.vision_model.is_empty() {
+        cfg.vision_model = DEFAULT_VISION_MODEL.into();
+    }
     cfg
 }
 
 fn save_config(cfg: &Config) {
     let s = format!(
-        "ollama_url={}\nmodel={}\nappend_date={}\nnever_dates={}\n",
+        "ollama_url={}\nmodel={}\nvision_model={}\nappend_date={}\nnever_dates={}\nforce_ocr={}\n",
         cfg.ollama_url.trim(),
         cfg.model.trim(),
+        cfg.vision_model.trim(),
         cfg.append_date,
-        cfg.never_dates
+        cfg.never_dates,
+        cfg.force_ocr
     );
     let _ = std::fs::write(config_path(), s);
 }
@@ -431,6 +443,130 @@ fn sanitize_filename(raw: &str) -> String {
     s = out;
     s = s.trim_matches(|c| c == '.' || c == '_' || c == '-').to_string();
     s.chars().take(80).collect()
+}
+
+// ---------------------------------------------------------------------------
+// AI OCR (Ollama vision model) — for scanned PDFs and forced OCR
+// ---------------------------------------------------------------------------
+
+/// Pull embedded JPEG images out of a PDF (scanned pages are usually
+/// DCTDecode/JPEG streams). Returns raw JPEG bytes, one per image found.
+fn extract_pdf_images(path: &Path) -> Vec<Vec<u8>> {
+    let doc = match lopdf::Document::load(path) {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+    let mut images = Vec::new();
+    for (_id, obj) in doc.objects.iter() {
+        let lopdf::Object::Stream(stream) = obj else {
+            continue;
+        };
+        // Must be an Image XObject.
+        let is_image = stream
+            .dict
+            .get(b"Subtype")
+            .and_then(|s| s.as_name())
+            .map(|n| n == b"Image")
+            .unwrap_or(false);
+        if !is_image {
+            continue;
+        }
+        // Only DCTDecode (JPEG) streams are usable as-is; the raw
+        // content is already a valid JPEG. Other filters (Flate, etc.)
+        // would need pixel decoding + re-encoding, which we skip.
+        let is_jpeg = match stream.dict.get(b"Filter") {
+            Ok(f) => match f.as_name() {
+                Ok(n) => n == b"DCTDecode",
+                Err(_) => f
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter().any(|x| {
+                            x.as_name().map(|n| n == b"DCTDecode").unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false),
+            },
+            Err(_) => false,
+        };
+        if is_jpeg && !stream.content.is_empty() {
+            images.push(stream.content.clone());
+        }
+    }
+    images
+}
+
+/// Ask the vision model to transcribe one image. Returns the raw text.
+fn ocr_image(cfg: &Config, image_bytes: &[u8]) -> Result<String, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .map_err(|e| format!("OCR request failed: {e}"))?;
+    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, image_bytes);
+    let body = serde_json::json!({
+        "model": cfg.vision_model,
+        "stream": false,
+        "messages": [{
+            "role": "user",
+            "content": "Transcribe all text visible in this image exactly, preserving line breaks. Do not add any explanation, summary, or extra words — only the transcribed text.",
+            "images": [b64]
+        }]
+    });
+    let resp = client
+        .post(format!("{}/api/chat", cfg.ollama_url.trim_end_matches('/')))
+        .json(&body)
+        .send()
+        .map_err(|e| format!("OCR request failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "Vision model \"{}\" returned {}. Is it pulled? (ollama pull {})",
+            cfg.vision_model,
+            resp.status(),
+            cfg.vision_model
+        ));
+    }
+    let v: serde_json::Value = resp
+        .json()
+        .map_err(|e| format!("OCR response unreadable: {e}"))?;
+    let text = v["message"]["content"]
+        .as_str()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if text.is_empty() {
+        return Err("Vision model returned no text for this image.".into());
+    }
+    Ok(text)
+}
+
+/// OCR a PDF: transcribe each embedded image (first page first) and
+/// join the results. Returns the combined transcribed text.
+fn ocr_pdf(cfg: &Config, path: &Path) -> Result<String, String> {
+    let images = extract_pdf_images(path);
+    if images.is_empty() {
+        return Err(
+            "No usable images found in this PDF (scanned pages must be JPEG).".into(),
+        );
+    }
+    let mut parts = Vec::new();
+    for img in &images {
+        match ocr_image(cfg, img) {
+            Ok(t) => parts.push(t),
+            Err(e) => {
+                // If the first image fails (e.g. model not pulled),
+                // bail immediately — retrying the rest won't help.
+                if parts.is_empty() {
+                    return Err(e);
+                }
+                // Otherwise keep what we have and move on.
+                break;
+            }
+        }
+    }
+    let combined = parts.join("\n").trim().to_string();
+    if combined.is_empty() {
+        return Err("OCR produced no text.".into());
+    }
+    Ok(combined)
 }
 
 fn ask_ollama(cfg: &Config, path: &Path, content: &str, attempt: u32) -> Result<String, String> {
@@ -1005,8 +1141,10 @@ struct NamerApp {
     // settings fields
     url_edit: String,
     model_edit: String,
+    vision_model_edit: String,
     append_date: bool,
     never_dates: bool,
+    force_ocr: bool,
     settings_status: String,
     menu_on: bool,
     // rename flow
@@ -1026,11 +1164,48 @@ struct NamerApp {
     update_progress: (u64, u64),
 }
 
+/// Document extraction with OCR support:
+/// - force_ocr on a PDF → skip text extraction, OCR directly.
+/// - PDF with no readable text → automatically try AI OCR; if OCR
+///   fails, return the original "no readable text" error.
+fn extract_for_naming(cfg: &Config, path: &Path) -> Result<Extracted, String> {
+    let is_pdf = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.eq_ignore_ascii_case("pdf"))
+        .unwrap_or(false);
+    if is_pdf && cfg.force_ocr {
+        let text = ocr_pdf(cfg, path)?;
+        let text: String = text.chars().take(MAX_CONTENT_CHARS).collect();
+        if text.trim().is_empty() {
+            return Err("OCR produced no text.".into());
+        }
+        return Ok(Extracted::Text(text));
+    }
+    match extract_content(path) {
+        Ok(e) => Ok(e),
+        Err(e) if is_pdf && e.contains("no readable text") => {
+            match ocr_pdf(cfg, path) {
+                Ok(text) => {
+                    let text: String = text.chars().take(MAX_CONTENT_CHARS).collect();
+                    if text.trim().is_empty() {
+                        Err(e)
+                    } else {
+                        Ok(Extracted::Text(text))
+                    }
+                }
+                Err(_) => Err(e),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
 fn rename_worker(path: PathBuf, cfg: Config, tx: mpsc::Sender<WorkerMsg>, attempt: u32) {
     let send = |m| {
         let _ = tx.send(m);
     };
-    let extracted = match extract_content(&path) {
+    let extracted = match extract_for_naming(&cfg, &path) {
         Ok(e) => e,
         Err(e) => {
             send(WorkerMsg::Failed(e));
@@ -1073,7 +1248,7 @@ enum BatchMsg {
 
 fn batch_worker(idx: usize, path: PathBuf, cfg: Config, tx: mpsc::Sender<BatchMsg>) {
     let result: Result<BatchProposal, String> = (|| {
-        match extract_content(&path)? {
+        match extract_for_naming(&cfg, &path)? {
             Extracted::DateTime(dt, src) => Ok(BatchProposal {
                 stem: sanitize_filename(&dt.format("%m-%d-%y-%H-%M-%S").to_string()),
                 date_source: Some(src.to_string()),
@@ -1263,6 +1438,8 @@ impl NamerApp {
             file_path,
             url_edit: cfg.ollama_url.clone(),
             model_edit: cfg.model.clone(),
+            vision_model_edit: cfg.vision_model.clone(),
+            force_ocr: cfg.force_ocr,
             append_date: cfg.append_date,
             never_dates: cfg.never_dates,
             cfg,
@@ -1382,8 +1559,10 @@ impl NamerApp {
     fn save_settings_from_ui(&mut self) {
         self.cfg.ollama_url = self.url_edit.trim().to_string();
         self.cfg.model = self.model_edit.trim().to_string();
+        self.cfg.vision_model = self.vision_model_edit.trim().to_string();
         self.cfg.append_date = self.append_date;
         self.cfg.never_dates = self.never_dates;
+        self.cfg.force_ocr = self.force_ocr;
         save_config(&self.cfg);
     }
 
@@ -1515,8 +1694,17 @@ impl NamerApp {
                     };
                 }
             });
+            ui.horizontal(|ui| {
+                ui.label("Vision model (for OCR):");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.vision_model_edit)
+                        .desired_width(280.0),
+                );
+            });
+            ui.label("Used when a PDF has no readable text, or when Force AI OCR is on. Pull it first: ollama pull moondream");
             ui.checkbox(&mut self.append_date, "Append date (_DD-Mon-YYYY) when the content has one");
             ui.checkbox(&mut self.never_dates, "Never add dates to document names");
+            ui.checkbox(&mut self.force_ocr, "Force AI OCR for PDFs (ignore the text layer, read the images instead)");
             if ui.button("Save settings").clicked() {
                 self.save_settings_from_ui();
                 self.settings_status = "Settings saved.".into();
