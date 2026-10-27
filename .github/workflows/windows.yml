@@ -21,6 +21,12 @@ jobs:
           flutter create --platforms=windows --project-name filenamer_ai_flutter app
           Copy-Item -Force -Recurse lib/* app/lib/
           Copy-Item -Force pubspec.yaml app/pubspec.yaml
+          # Window title: flutter create names the native window after the
+          # project (filenamer_ai_flutter) — replace it with the app name.
+          $mainCpp = 'app/windows/runner/main.cpp'
+          if (Test-Path $mainCpp) {
+            (Get-Content $mainCpp -Raw) -replace 'filenamer_ai_flutter', 'File Namer AI' | Set-Content $mainCpp
+          }
       - name: Build Windows release
         run: |
           cd app
