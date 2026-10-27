@@ -3548,6 +3548,13 @@ fn main() {
     }
     let options = eframe::NativeOptions {
         viewport,
+        // Wgpu (DirectX on Windows, Metal on Mac) instead of the
+        // default Glow (OpenGL) renderer: Glow flashed black and
+        // stuttered while dragging/resizing on Windows + NVIDIA,
+        // in Utility Closet, File Namer AI, and Tuya alike — the
+        // same egui 0.27 stack, the same default renderer, the
+        // same symptom. Wgpu is the native path on both platforms.
+        renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
     let _ = eframe::run_native(
