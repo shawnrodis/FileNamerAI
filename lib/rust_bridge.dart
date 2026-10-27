@@ -31,22 +31,22 @@ import 'dart:isolate';
 
 import 'package:ffi/ffi.dart';
 
-typedef _FnaProposeNative = ffi.Pointer<ffi.Utf8> Function(
-    ffi.Pointer<ffi.Utf8>, ffi.Pointer<ffi.Utf8>, ffi.Uint32);
-typedef _FnaProposeDart = ffi.Pointer<ffi.Utf8> Function(
-    ffi.Pointer<ffi.Utf8>, ffi.Pointer<ffi.Utf8>, int);
-typedef _FnaStringNative = ffi.Pointer<ffi.Utf8> Function(
-    ffi.Pointer<ffi.Utf8>);
-typedef _FnaStringDart = ffi.Pointer<ffi.Utf8> Function(
-    ffi.Pointer<ffi.Utf8>);
-typedef _FnaTwoStringNative = ffi.Pointer<ffi.Utf8> Function(
-    ffi.Pointer<ffi.Utf8>, ffi.Pointer<ffi.Utf8>);
-typedef _FnaTwoStringDart = ffi.Pointer<ffi.Utf8> Function(
-    ffi.Pointer<ffi.Utf8>, ffi.Pointer<ffi.Utf8>);
-typedef _FnaNoArgNative = ffi.Pointer<ffi.Utf8> Function();
-typedef _FnaNoArgDart = ffi.Pointer<ffi.Utf8> Function();
-typedef _FnaFreeNative = ffi.Void Function(ffi.Pointer<ffi.Utf8>);
-typedef _FnaFreeDart = void Function(ffi.Pointer<ffi.Utf8>);
+typedef _FnaProposeNative = ffi.Pointer<Utf8> Function(
+    ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Uint32);
+typedef _FnaProposeDart = ffi.Pointer<Utf8> Function(
+    ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, int);
+typedef _FnaStringNative = ffi.Pointer<Utf8> Function(
+    ffi.Pointer<Utf8>);
+typedef _FnaStringDart = ffi.Pointer<Utf8> Function(
+    ffi.Pointer<Utf8>);
+typedef _FnaTwoStringNative = ffi.Pointer<Utf8> Function(
+    ffi.Pointer<Utf8>, ffi.Pointer<Utf8>);
+typedef _FnaTwoStringDart = ffi.Pointer<Utf8> Function(
+    ffi.Pointer<Utf8>, ffi.Pointer<Utf8>);
+typedef _FnaNoArgNative = ffi.Pointer<Utf8> Function();
+typedef _FnaNoArgDart = ffi.Pointer<Utf8> Function();
+typedef _FnaFreeNative = ffi.Void Function(ffi.Pointer<Utf8>);
+typedef _FnaFreeDart = void Function(ffi.Pointer<Utf8>);
 typedef _FnaMenuNative = ffi.Int32 Function();
 typedef _FnaMenuDart = int Function();
 
@@ -62,7 +62,7 @@ class RustBridge {
   }
 
   static String _readAndFree(
-      ffi.DynamicLibrary lib, ffi.Pointer<ffi.Utf8> ptr) {
+      ffi.DynamicLibrary lib, ffi.Pointer<Utf8> ptr) {
     if (ptr == ffi.nullptr) {
       throw StateError('Rust core returned a null string');
     }
@@ -82,8 +82,7 @@ class RustBridge {
   /// document naming can block on Ollama for up to 180s.
   static Future<Map<String, dynamic>> propose(
       String path, String configJson, int attempt) async {
-    final json = await Isolate.run(
-        _proposeIsolate, (path, configJson, attempt));
+    final json = await Isolate.run(() => _proposeIsolate((path, configJson, attempt)));
     return _decode(json);
   }
 
@@ -102,7 +101,7 @@ class RustBridge {
   }
 
   static Future<List<String>> checkModels(String ollamaUrl) async {
-    final json = await Isolate.run(_checkModelsIsolate, ollamaUrl);
+    final json = await Isolate.run(() => _checkModelsIsolate(ollamaUrl));
     final result = _decode(json);
     if (result['error'] != null) {
       throw StateError(result['error'] as String);
@@ -116,7 +115,7 @@ class RustBridge {
   /// callback in this version — the UI shows an indeterminate
   /// "Pulling…" state, then refreshes the model list).
   static Future<void> pullModel(String ollamaUrl, String model) async {
-    final json = await Isolate.run(_pullModelIsolate, (ollamaUrl, model));
+    final json = await Isolate.run(() => _pullModelIsolate((ollamaUrl, model)));
     final result = _decode(json);
     if (result['ok'] != true) {
       throw StateError((result['error'] as String?) ?? 'Pull failed');
@@ -126,7 +125,7 @@ class RustBridge {
   /// Download the Ollama installer via the Rust core; returns the
   /// downloaded file path. The caller launches it.
   static Future<String> downloadOllamaInstaller() async {
-    final json = await Isolate.run(_downloadOllamaIsolate, 0);
+    final json = await Isolate.run(() => _downloadOllamaIsolate(0));
     final result = _decode(json);
     if (result['path'] == null) {
       throw StateError((result['error'] as String?) ?? 'Download failed');
@@ -142,7 +141,7 @@ class RustBridge {
   }
 
   static Future<void> installMenu(String exePath) async {
-    final json = await Isolate.run(_installMenuIsolate, exePath);
+    final json = await Isolate.run(() => _installMenuIsolate(exePath));
     final result = _decode(json);
     if (result['ok'] != true) {
       throw StateError((result['error'] as String?) ?? 'Install failed');
@@ -150,7 +149,7 @@ class RustBridge {
   }
 
   static Future<void> uninstallMenu() async {
-    final json = await Isolate.run(_uninstallMenuIsolate, 0);
+    final json = await Isolate.run(() => _uninstallMenuIsolate(0));
     final result = _decode(json);
     if (result['ok'] != true) {
       throw StateError((result['error'] as String?) ?? 'Remove failed');
