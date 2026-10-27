@@ -7,7 +7,8 @@
 Right-click any file, or drag files onto the app, to rename them locally:
 photos and videos get automatic, customizable date-based names, documents —
 including Word, Excel, and PowerPoint files — get smart names from their
-contents, in batches too. For Windows and Mac. No cloud, no uploads.
+contents, in batches too. For Windows — the Mac update is coming next.
+No cloud, no uploads.
 
 Built with a Rust core and a [Flutter](https://flutter.dev/) UI, in the
 style of RustDesk: all naming, extraction, and Ollama logic lives in
