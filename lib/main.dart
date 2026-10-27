@@ -23,9 +23,9 @@
 //    titles are never invented.
 //  - Already-correctly-named files are left alone.
 //
-// KNOWN GAPS (honest, not faked): Mac DMG; automatic update
-// installer (update check is implemented, it only reports
-// availability). AI OCR for image-only PDFs works via the Rust core
+// KNOWN GAPS (honest, not faked): Mac DMG. Automatic update
+// install is implemented (verified download + delayed installer
+// launch, same pattern as Utility Closet). AI OCR for image-only PDFs works via the Rust core
 // (Ollama vision model), with a Force AI OCR toggle in Settings.
 // Windows right-click menu
 // install/remove is implemented via per-user HKCU reg commands. File "Created" time is NOT exposed by Dart's FileStat
@@ -51,7 +51,7 @@ import 'rust_bridge.dart';
 
 // ---------------------------------------------------------------- settings
 
-const String appVersion = '1.4.2';
+const String appVersion = '1.4.3';
 
 class Settings {
   String ollamaUrl;
@@ -517,6 +517,12 @@ class _HomePageState extends State<HomePage> {
   String settingsStatus = '';
   String updateStatus = 'Not checked';
   bool updateChecking = false;
+  String? updateTag;
+  String updateAssetUrl = '';
+  String updateAssetName = '';
+  int updateAssetSize = 0;
+  bool updateDownloading = false;
+  double updateProgress = 0;
   String menuStatus = 'Not checked';
   bool menuInstalled = false;
   int lastRenamed = 0;
@@ -707,7 +713,24 @@ class _HomePageState extends State<HomePage> {
     }
     await _resolveBatch();
     setState(() => processing = false);
-    _setLog('Proposed names for ${toPropose.length} file(s). Edit Final Name, then Rename All.');
+    // egui batch footer counts: to rename / already named / errors.
+    // A batch where every file is already correct must say so plainly
+    // instead of inviting a Rename All that would rename nothing.
+    final toRename = items
+        .where((i) =>
+            !i.alreadyCorrect &&
+            i.finalName.isNotEmpty &&
+            i.finalName != i.baseName)
+        .length;
+    final alreadyNamed = items.where((i) => i.alreadyCorrect).length;
+    final errors = items.where((i) => i.proposeError).length;
+    if (toRename == 0 && alreadyNamed > 0 && errors == 0) {
+      _setLog(
+          'No renames needed — all $alreadyNamed file(s) already correctly named.');
+    } else {
+      _setLog(
+          '$toRename to rename • $alreadyNamed already named • $errors errors. Edit Final Name, then Rename All.');
+    }
   }
 
   Future<void> _proposeAll() async {
@@ -834,6 +857,10 @@ class _HomePageState extends State<HomePage> {
     setState(() {
       updateChecking = true;
       updateStatus = 'Checking…';
+      updateTag = null;
+      updateAssetUrl = '';
+      updateAssetName = '';
+      updateAssetSize = 0;
     });
     try {
       final resp = await http.get(
@@ -851,14 +878,94 @@ class _HomePageState extends State<HomePage> {
         } else if (tag == current) {
           setState(() => updateStatus = 'Up to date (v$current).');
         } else {
-          setState(() => updateStatus =
-              'Update available: $tag (you have v$current). Auto-install is not implemented yet — download it from the releases page.');
+          // Installer asset only, exact name — never a zip or a stray file.
+          final expected = 'FileNamerAI-Setup-v$tag.exe';
+          Map<String, dynamic>? asset;
+          for (final a in (body['assets'] as List?) ?? []) {
+            if (a is Map<String, dynamic> && a['name'] == expected) {
+              asset = a;
+              break;
+            }
+          }
+          if (asset == null) {
+            setState(() => updateStatus =
+                'Update available: $tag (you have v$current) — installer not found on the releases page.');
+          } else {
+            // Extract before setState: a captured nullable local is
+            // not promoted inside the setState closure.
+            final assetUrl =
+                (asset['browser_download_url'] as String?) ?? '';
+            final assetSize = (asset['size'] as int?) ?? 0;
+            setState(() {
+              updateTag = tag;
+              updateAssetUrl = assetUrl;
+              updateAssetName = expected;
+              updateAssetSize = assetSize;
+              updateStatus = 'Update available: $tag (you have v$current).';
+            });
+          }
         }
       }
     } catch (e) {
       setState(() => updateStatus = 'Could not check for updates: $e');
     }
     setState(() => updateChecking = false);
+  }
+
+  Future<void> _downloadAndInstallUpdate() async {
+    if (updateAssetUrl.isEmpty || updateAssetName.isEmpty) return;
+    if (!Platform.isWindows) {
+      setState(() => updateStatus =
+          'Auto-install is Windows only — download it from the releases page.');
+      return;
+    }
+    setState(() {
+      updateDownloading = true;
+      updateProgress = 0;
+    });
+    try {
+      final req = await http.Client().send(http.Request('GET', Uri.parse(updateAssetUrl)));
+      if (req.statusCode != 200) throw StateError('HTTP ${req.statusCode}');
+      final total = req.contentLength ?? updateAssetSize;
+      final chunks = <int>[];
+      var got = 0;
+      await for (final chunk in req.stream) {
+        chunks.addAll(chunk);
+        got += chunk.length;
+        if (total > 0) setState(() => updateProgress = got / total);
+      }
+      // Verify before launching: a redirect/error page or truncated file
+      // must never be run as an installer, and must never exit the app.
+      if (chunks.isEmpty ||
+          chunks.length < 2 ||
+          chunks[0] != 0x4D ||
+          chunks[1] != 0x5A ||
+          (total > 0 && got != total)) {
+        throw StateError('Download verification failed');
+      }
+      final dest =
+          File('${Directory.systemTemp.path}\\${updateAssetName}');
+      await dest.writeAsBytes(chunks);
+      setState(() =>
+          updateStatus = 'Downloaded ${updateAssetName} — launching installer…');
+      // Do NOT run the installer directly: it would try to replace the
+      // running app exe while it is still locked. Write a tiny .bat
+      // that waits 2s (app fully closed by then), runs the installer,
+      // then deletes itself. The .bat survives the app exit because
+      // cmd owns it.
+      final cleanPath = dest.path.replaceAll('"', '');
+      final bat =
+          File('${Directory.systemTemp.path}\\FileNamerAI-update.bat');
+      await bat.writeAsString(
+          '@echo off\r\ntimeout /t 2 /nobreak >nul\r\nstart "" "$cleanPath"\r\ndel "%~f0"\r\n');
+      await Process.start('cmd', ['/C', bat.path]);
+      exit(0);
+    } catch (_) {
+      setState(() {
+        updateDownloading = false;
+        updateStatus = 'Download failed — check your connection and try again.';
+      });
+    }
   }
 
   Future<void> _checkMenu() async {
@@ -963,7 +1070,14 @@ class _HomePageState extends State<HomePage> {
             ),
           if (single == null)
             ElevatedButton.icon(
-              onPressed: processing ? null : _renameAll,
+              onPressed: processing ||
+                      (items.isNotEmpty &&
+                          !items.any((i) =>
+                              !i.alreadyCorrect &&
+                              i.finalName.isNotEmpty &&
+                              i.finalName != i.baseName))
+                  ? null
+                  : _renameAll,
               icon: const Icon(Icons.drive_file_rename_outline),
               label: const Text('Rename All'),
             ),
@@ -1050,7 +1164,7 @@ class _HomePageState extends State<HomePage> {
         const SizedBox(height: 16),
         Wrap(spacing: 8, children: [
           ElevatedButton(
-            onPressed: processing
+            onPressed: processing || item.alreadyCorrect
                 ? null
                 : () async {
                     if (item.proposed.isEmpty) {
@@ -1127,13 +1241,16 @@ class _HomePageState extends State<HomePage> {
                         overflow: TextOverflow.ellipsis))),
                 DataCell(SizedBox(
                   width: 240,
-                  child: TextFormField(
-                    key: ValueKey('${item.file.path}|${item.finalName}'),
-                    initialValue: item.finalName,
-                    decoration: const InputDecoration(
-                        border: OutlineInputBorder(), isDense: true),
-                    onChanged: (v) => item.finalName = v,
-                  ),
+                  child: item.alreadyCorrect
+                      ? Text('✓ ${item.finalName}',
+                          style: const TextStyle(color: Colors.green))
+                      : TextFormField(
+                          key: ValueKey('${item.file.path}|${item.finalName}'),
+                          initialValue: item.finalName,
+                          decoration: const InputDecoration(
+                              border: OutlineInputBorder(), isDense: true),
+                          onChanged: (v) => item.finalName = v,
+                        ),
                 )),
                 DataCell(SizedBox(
                     width: 180,
@@ -1161,6 +1278,15 @@ class _HomePageState extends State<HomePage> {
         onPressed: updateChecking ? null : _checkUpdates,
         child: const Text('Check for updates'),
       ),
+      if (updateTag != null) ...[
+        const SizedBox(height: 8),
+        ElevatedButton(
+          onPressed: updateDownloading ? null : _downloadAndInstallUpdate,
+          child: const Text('Download & Install'),
+        ),
+        if (updateDownloading)
+          Text('Downloading… ${(updateProgress * 100).toStringAsFixed(0)}%'),
+      ],
       const SizedBox(height: 16),
       // (b) Local AI (Ollama).
       const Text('Local AI (Ollama)',
@@ -1444,7 +1570,7 @@ class _HomePageState extends State<HomePage> {
           '• The Advanced photo/video naming section above can change any of these defaults.'),
       const SizedBox(height: 16),
       const Text(
-        'Gaps: Mac build and automatic updater are NOT implemented yet. AI OCR for image-only PDFs now works via the Rust core (Ollama vision model), and file Created time works via Rust. Settings are saved on disk and reloaded on launch.',
+        'Gaps: Mac build is NOT implemented yet. Automatic update install is implemented (verified download + delayed installer launch). AI OCR for image-only PDFs now works via the Rust core (Ollama vision model), and file Created time works via Rust. Settings are saved on disk and reloaded on launch.',
         style: TextStyle(color: Colors.grey),
       ),
       if (!_settingsLoaded) const Text('Loading saved settings…'),
