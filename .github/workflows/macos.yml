@@ -71,6 +71,50 @@ jobs:
                              check=True, stdout=subprocess.DEVNULL)
           print('app icon regenerated from assets/icon.png')
           PYEOF
+          # Window title: flutter create names the native window after the
+          # project (filenamer_ai_flutter) — same class of bug as the
+          # Utility Closet v1.1.1 title fix, which patched
+          # windows/runner/main.cpp. On macOS the title comes from the
+          # generated Runner instead, so patch all three places that
+          # can carry the slug: the MainMenu.xib window title, the
+          # MainFlutterWindow title at runtime, and the bundle name
+          # in Info.plist. Otherwise the Mac title bar reads the
+          # project slug instead of "File Namer AI".
+          python3 - << 'PYEOF'
+          import pathlib, plistlib
+          runner = pathlib.Path('app/macos/Runner')
+          xib = runner / 'MainMenu.xib'
+          if xib.exists():
+              t = xib.read_text()
+              t2 = t.replace('filenamer_ai_flutter', 'File Namer AI')
+              xib.write_text(t2)
+              print('MainMenu.xib title patched' if t2 != t else 'MainMenu.xib: no slug found')
+          else:
+              print('MainMenu.xib not found, skipping')
+          swift = runner / 'MainFlutterWindow.swift'
+          if swift.exists():
+              t = swift.read_text()
+              if 'self.title = "File Namer AI"' not in t and 'super.awakeFromNib()' in t:
+                  t = t.replace('super.awakeFromNib()',
+                                'self.title = "File Namer AI"\n    super.awakeFromNib()', 1)
+                  swift.write_text(t)
+                  print('MainFlutterWindow.swift title set')
+              else:
+                  print('MainFlutterWindow.swift: title already set or pattern missing')
+          else:
+              print('MainFlutterWindow.swift not found, skipping')
+          plist = runner / 'Info.plist'
+          if plist.exists():
+              with open(plist, 'rb') as f:
+                  d = plistlib.load(f)
+              d['CFBundleName'] = 'File Namer AI'
+              d['CFBundleDisplayName'] = 'File Namer AI'
+              with open(plist, 'wb') as f:
+                  plistlib.dump(d, f)
+              print('Info.plist bundle name set to File Namer AI')
+          else:
+              print('Info.plist not found, skipping')
+          PYEOF
           cd app
           flutter pub get
           flutter build macos --release
