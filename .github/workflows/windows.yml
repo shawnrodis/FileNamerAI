@@ -37,6 +37,7 @@ jobs:
       - name: Build NSIS installer
         run: |
           if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) { choco install nsis -y }
+          $env:PATH += ';C:\Program Files (x86)\NSIS'
           Copy-Item -Recurse -Force app/build/windows/x64/runner/Release installer/staging
           cd installer
           makensis installer.nsi
