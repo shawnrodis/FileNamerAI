@@ -568,9 +568,7 @@ class _HomePageState extends State<HomePage> {
       setState(() {
         ollamaModels = models;
         ollamaStatus = 'Ollama running — ${models.length} model(s) installed';
-        ollamaSetupLog = models.isEmpty
-            ? 'No models installed yet.'
-            : 'Installed: ${models.join(', ')}';
+        ollamaSetupLog = '';
       });
     } catch (_) {
       setState(() {
@@ -1361,23 +1359,26 @@ class _HomePageState extends State<HomePage> {
       const Text(
           'First-time setup: install Ollama from ollama.com, start it, then download the models in the Models section below — no terminal needed.'),
       const SizedBox(height: 16),
-      // (c) Models.
+      // (c) Models — consolidated: one row per configured model
+      // (naming documents / PDF OCR) with its installed state, plus
+      // a single line for any extra models Ollama happens to have.
+      // Previously this section listed the same models three times:
+      // an "Installed: ..." log line, a full installed list with a
+      // misleading Download button on already-installed models, and
+      // the per-model rows. The log line now only carries
+      // pull/installer progress and results.
       const Text('Models',
           style: TextStyle(fontWeight: FontWeight.bold)),
       const Text(
-          'Edit a name to switch models, then Save settings. Download right here — no terminal needed.'),
+          'Names are edited above in Local AI. This is what Ollama actually has installed — download right here, no terminal needed.'),
       Text('Status: $ollamaStatus'),
       if (ollamaSetupLog.isNotEmpty) Text(ollamaSetupLog),
-      if (ollamaModels.isEmpty)
-        const Text('No installed models listed yet — press Refresh.')
-      else
-        ...ollamaModels.map((m) => Row(children: [
-              Expanded(child: Text(m)),
-              TextButton(
-                onPressed: ollamaBusy ? null : () => _pullModel(m),
-                child: const Text('Download'),
-              ),
-            ])),
+      if (ollamaModels
+          .where((n) => ![settings.model, settings.visionModel]
+              .any((m) => n == m || n.startsWith('$m:')))
+          .isNotEmpty)
+        Text(
+            'Also installed: ${ollamaModels.where((n) => ![settings.model, settings.visionModel].any((m) => n == m || n.startsWith('$m:'))).join(', ')}'),
       Wrap(spacing: 8, children: [
         ElevatedButton(
           onPressed: ollamaBusy ? null : _checkOllama,
@@ -1403,7 +1404,9 @@ class _HomePageState extends State<HomePage> {
           const SizedBox(width: 8),
           TextButton(
             onPressed: ollamaBusy ? null : () => _pullModel(m),
-            child: const Text('Download'),
+            // "Download" on an installed model was misleading — it
+            // re-pulls. Say so when that is what it does.
+            child: Text(installed(m) ? 'Re-download' : 'Download'),
           ),
         ]),
       if (!Platform.isWindows)
