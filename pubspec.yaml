@@ -1,5 +1,5 @@
 name: filenamer_ai_flutter
-description: "File Namer AI — Flutter version. Rename photos/videos by date and documents via local Ollama."
+description: "File Namer AI — Rust core + Flutter UI. Rename photos/videos by date and documents via local Ollama."
 publish_to: 'none'
 version: 1.4.0+1
 
@@ -9,9 +9,9 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  archive: ^3.6.1
   desktop_drop: ^0.6.1
   file_picker: ^8.1.4
+  ffi: ^2.1.0
   http: ^1.2.2
   path: ^1.9.0
   path_provider: ^2.1.4

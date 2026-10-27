@@ -3,8 +3,9 @@
 ; Installs to %LOCALAPPDATA%\FileNamerAI, registers the right-click
 ; context menu (HKCU), and creates an Add/Remove Programs entry.
 ; Mirrors the egui app's installer, adapted for a Flutter build:
-; the exe plus flutter_windows.dll, plugin DLLs, and the data/ folder
-; (app.so, icudtl.dat, flutter_assets) must all be installed together.
+; the exe plus flutter_windows.dll, plugin DLLs, the Rust core DLL
+; (filenamer_core.dll), and the data/ folder (app.so, icudtl.dat,
+; flutter_assets) must all be installed together.
 
 !define APP_NAME "File Namer AI"
 !define APP_VERSION "1.4.0"
@@ -72,6 +73,7 @@ SectionEnd
 
 Section "Uninstall"
   Delete "$INSTDIR\filenamer_ai_flutter.exe"
+  Delete "$INSTDIR\filenamer_core.dll"
   Delete "$INSTDIR\flutter_windows.dll"
   Delete "$INSTDIR\desktop_drop_plugin.dll"
   Delete "$INSTDIR\dartjni.dll"

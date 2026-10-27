@@ -9,10 +9,13 @@ photos and videos get automatic, customizable date-based names, documents —
 including Word, Excel, and PowerPoint files — get smart names from their
 contents, in batches too. For Windows and Mac. No cloud, no uploads.
 
-Built with [Flutter](https://flutter.dev/) and Dart. The previous Rust/egui
-version is preserved on the `egui-legacy` branch. Distributed as an
-installer, no console window. Runs as a normal user (no administrator
-rights needed).
+Built with a Rust core and a [Flutter](https://flutter.dev/) UI, in the
+style of RustDesk: all naming, extraction, and Ollama logic lives in
+`rust/` (extracted from the egui app) and is called from Flutter via
+FFI (`lib/rust_bridge.dart`, hand-written C ABI — no codegen). The
+previous all-Rust egui version is preserved on the `egui-legacy`
+branch. Distributed as an installer, no console window. Runs as a
+normal user (no administrator rights needed).
 
 ## Download
 

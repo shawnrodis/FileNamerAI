@@ -1,5 +1,7 @@
-// File Namer AI — Flutter version (v1.4.0). The previous Rust/egui version
-// is preserved on the egui-legacy branch; this is now the main app.
+// File Namer AI — Rust/Flutter version (v1.4.0). Flutter UI, Rust core
+// (rust/src/lib.rs, extracted from the egui app, branch egui-legacy).
+// Naming, extraction, and Ollama behaviour come from Rust via FFI;
+// Dart code in this file is UI only and must not reimplement naming.
 //
 // Core parity with the egui app, in one file on purpose: the GitHub Actions
 // workflow generates the Windows runner with `flutter create` and copies
@@ -36,13 +38,14 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
-import 'package:archive/archive.dart';
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
+
+import 'rust_bridge.dart';
 
 // ---------------------------------------------------------------- settings
 
@@ -175,433 +178,13 @@ String formatPhotoName(DateTime dt, Settings s, bool hasRealExif) {
 String formatDocDate(DateTime dt) =>
     '${_two(dt.day)}-${_months[dt.month - 1]}-${dt.year}';
 
-String _titleCase(String s) => s
-    .split(RegExp(r'\s+'))
-    .where((w) => w.isNotEmpty)
-    .map((w) => w[0].toUpperCase() + (w.length > 1 ? w.substring(1) : ''))
-    .join(' ');
 
-// ------------------------------------------------------------- EXIF (JPEG)
-
-int _u16(ByteData d, int off, bool le) =>
-    le ? d.getUint16(off, Endian.little) : d.getUint16(off, Endian.big);
-int _u32(ByteData d, int off, bool le) =>
-    le ? d.getUint32(off, Endian.little) : d.getUint32(off, Endian.big);
-
-DateTime? _parseTiffDate(ByteData d, int tiffStart, bool le) {
-  int readAscii(int ifdOff, int tag) {
-    // Returns offset of the ASCII value, or -1.
-    if (ifdOff + 2 > d.lengthInBytes) return -1;
-    final count = _u16(d, ifdOff, le);
-    for (var i = 0; i < count; i++) {
-      final e = ifdOff + 2 + i * 12;
-      if (e + 12 > d.lengthInBytes) break;
-      if (_u16(d, e, le) != tag) continue;
-      final type = _u16(d, e + 2, le);
-      final n = _u32(d, e + 4, le);
-      if (type != 2 || n == 0) return -1;
-      final valOff = _u32(d, e + 8, le);
-      if (n <= 4) return e + 8;
-      final abs = tiffStart + valOff;
-      return abs < d.lengthInBytes ? abs : -1;
-    }
-    return -1;
-  }
-
-  String readString(int off) {
-    final bytes = <int>[];
-    for (var i = off; i < d.lengthInBytes; i++) {
-      final b = d.getUint8(i);
-      if (b == 0) break;
-      bytes.add(b);
-    }
-    return utf8.decode(bytes, allowMalformed: true);
-  }
-
-  DateTime? parseDate(String s) {
-    // "YYYY:MM:DD HH:MM:SS"
-    final m = RegExp(r'(\d{4}):(\d{2}):(\d{2})[ T](\d{2}):(\d{2}):(\d{2})')
-        .firstMatch(s);
-    if (m == null) return null;
-    try {
-      return DateTime(
-        int.parse(m[1]!), int.parse(m[2]!), int.parse(m[3]!),
-        int.parse(m[4]!), int.parse(m[5]!), int.parse(m[6]!));
-    } catch (_) {
-      return null;
-    }
-  }
-
-  final ifd0Off = tiffStart + _u32(d, tiffStart + 4, le);
-  // ExifIFD pointer is tag 0x8769 in IFD0; its value is an offset from TIFF start.
-  int exifPtr = -1;
-  if (ifd0Off + 2 <= d.lengthInBytes) {
-    final count = _u16(d, ifd0Off, le);
-    for (var i = 0; i < count; i++) {
-      final e = ifd0Off + 2 + i * 12;
-      if (e + 12 > d.lengthInBytes) break;
-      if (_u16(d, e, le) == 0x8769) exifPtr = _u32(d, e + 8, le);
-    }
-  }
-  if (exifPtr >= 0) {
-    final off = readAscii(tiffStart + exifPtr, 0x9003); // DateTimeOriginal
-    if (off >= 0) {
-      final dt = parseDate(readString(off));
-      if (dt != null) return dt;
-    }
-    final off2 = readAscii(tiffStart + exifPtr, 0x9004); // DateTimeDigitized
-    if (off2 >= 0) {
-      final dt = parseDate(readString(off2));
-      if (dt != null) return dt;
-    }
-  }
-  final off0 = readAscii(ifd0Off, 0x0132); // DateTime
-  if (off0 >= 0) return parseDate(readString(off0));
-  return null;
-}
-
-Future<DateTime?> parseExifDateTimeOriginal(File file) async {
-  try {
-    final bytes = await file.readAsBytes();
-    if (bytes.length < 4 || bytes[0] != 0xFF || bytes[1] != 0xD8) return null;
-    var i = 2;
-    while (i + 4 <= bytes.length) {
-      if (bytes[i] != 0xFF) break;
-      final marker = bytes[i + 1];
-      if (marker == 0xDA || marker == 0xD9) break; // SOS / EOI
-      final len = (bytes[i + 2] << 8) | bytes[i + 3];
-      if (marker == 0xE1 && len > 8) {
-        // APP1
-        final seg = bytes.sublist(i + 4, i + 2 + len);
-        if (seg.length > 6 &&
-            seg[0] == 0x45 && seg[1] == 0x78 && seg[2] == 0x69 && seg[3] == 0x66) {
-          final tiff = seg.sublist(6);
-          if (tiff.length < 8) return null;
-          final le = tiff[0] == 0x49; // 'II' little-endian
-          final d = ByteData.sublistView(Uint8List.fromList(tiff));
-          return _parseTiffDate(d, 0, le);
-        }
-      }
-      i += 2 + len;
-    }
-  } catch (_) {}
-  return null;
-}
-
-// ------------------------------------------------------------ MP4 creation
-
-Future<DateTime?> parseMp4Creation(File file) async {
-  try {
-    final raf = await file.open();
-    final head = await raf.read(2 * 1024 * 1024);
-    await raf.close();
-    for (var type in ['mvhd', 'mdhd']) {
-      final needle = utf8.encode(type);
-      for (var i = 0; i + 8 < head.length - 4; i++) {
-        if (head[i] == needle[0] && head[i + 1] == needle[1] &&
-            head[i + 2] == needle[2] && head[i + 3] == needle[3]) {
-          final v = head[i + 4];
-          int secs;
-          if (v == 1) {
-            if (i + 12 >= head.length) continue;
-            secs = 0;
-            for (var k = 0; k < 8; k++) secs = (secs << 8) | head[i + 5 + k];
-          } else {
-            if (i + 8 >= head.length) continue;
-            secs = (head[i + 5] << 24) | (head[i + 6] << 16) |
-                (head[i + 7] << 8) | head[i + 8];
-          }
-          const macEpoch = 2082844800;
-          if (secs > macEpoch) {
-            return DateTime.fromMillisecondsSinceEpoch(
-                (secs - macEpoch) * 1000, isUtc: true).toLocal();
-          }
-        }
-      }
-    }
-  } catch (_) {}
-  return null;
-}
-
-// --------------------------------------------------------- text extraction
-
-String _extractParenText(String s) {
-  final out = <String>[];
-  final re = RegExp(r'\((?:[^()\\]|\\.)*\)');
-  for (final m in re.allMatches(s)) {
-    var t = m.group(0)!;
-    t = t.substring(1, t.length - 1);
-    t = t.replaceAllMapped(RegExp(r'\\(.)'), (mm) => mm[1]!);
-    if (t.trim().isNotEmpty) out.add(t);
-  }
-  // Hex strings <48656C6C6F> that decode to printable text.
-  final hexRe = RegExp(r'<([0-9A-Fa-f\s]{4,})>');
-  for (final m in hexRe.allMatches(s)) {
-    final hex = m.group(1)!.replaceAll(RegExp(r'\s'), '');
-    if (hex.length.isOdd) continue;
-    final bytes = <int>[];
-    var ok = true;
-    for (var i = 0; i < hex.length; i += 2) {
-      final v = int.tryParse(hex.substring(i, i + 2), radix: 16);
-      if (v == null) {
-        ok = false;
-        break;
-      }
-      bytes.add(v);
-    }
-    if (!ok) continue;
-    final t = utf8.decode(bytes, allowMalformed: true);
-    if (t.trim().isNotEmpty && t.codeUnits.every((c) => c >= 32 && c < 127)) {
-      out.add(t);
-    }
-  }
-  return out.join(' ');
-}
-
-String _extractPdfText(List<int> bytes) {
-  final parts = <String>[];
-  // Try Flate-decoded streams first (most real PDFs), then raw text.
-  var i = 0;
-  while (i < bytes.length) {
-    // Find "stream" followed by EOL.
-    var idx = -1;
-    for (var j = i; j + 6 < bytes.length; j++) {
-      if (bytes[j] == 0x73 && bytes[j + 1] == 0x74 && bytes[j + 2] == 0x72 &&
-          bytes[j + 3] == 0x65 && bytes[j + 4] == 0x61 && bytes[j + 5] == 0x6D) {
-        idx = j;
-        break;
-      }
-    }
-    if (idx < 0) break;
-    var start = idx + 6;
-    if (start < bytes.length && bytes[start] == 0x0D) start++;
-    if (start < bytes.length && bytes[start] == 0x0A) start++;
-    var end = -1;
-    for (var j = start; j + 9 < bytes.length; j++) {
-      if (bytes[j] == 0x65 && bytes[j + 1] == 0x6E && bytes[j + 2] == 0x64 &&
-          bytes[j + 3] == 0x73 && bytes[j + 4] == 0x74 && bytes[j + 5] == 0x72 &&
-          bytes[j + 6] == 0x65 && bytes[j + 7] == 0x61 && bytes[j + 8] == 0x6D) {
-        end = j;
-        break;
-      }
-    }
-    if (end < 0) break;
-    try {
-      final decoded = zlib.decode(bytes.sublist(start, end));
-      final t = _extractParenText(latin1.decode(decoded, allowInvalid: true));
-      if (t.isNotEmpty) parts.add(t);
-    } catch (_) {}
-    i = end + 9;
-    if (parts.length > 200) break;
-  }
-  if (parts.isNotEmpty) return parts.join(' ');
-  return _extractParenText(latin1.decode(bytes, allowInvalid: true));
-}
-
-String _stripXml(String xml) {
-  var s = xml.replaceAll(RegExp(r'<[^>]+>'), ' ');
-  s = s.replaceAll('&amp;', '&').replaceAll('&lt;', '<').replaceAll('&gt;', '>')
-      .replaceAll('&quot;', '"').replaceAll('&apos;', "'");
-  s = s.replaceAll(RegExp(r'\s+'), ' ');
-  return s.trim();
-}
-
-String _extractOfficeText(List<int> bytes, String ext) {
-  try {
-    final archive = ZipDecoder().decodeBytes(bytes);
-    final texts = <String>[];
-    String? findText(String name) {
-      for (final f in archive.files) {
-        if (f.name == name && f.content != null) {
-          return utf8.decode(f.content as List<int>, allowMalformed: true);
-        }
-      }
-      return null;
-    }
-
-    if (ext == 'docx') {
-      final xml = findText('word/document.xml');
-      if (xml != null) texts.add(_stripXml(xml));
-      for (final f in archive.files) {
-        if ((f.name.startsWith('word/header') ||
-                f.name.startsWith('word/footer')) &&
-            f.name.endsWith('.xml') &&
-            f.content != null) {
-          texts.add(_stripXml(
-              utf8.decode(f.content as List<int>, allowMalformed: true)));
-        }
-      }
-    } else if (ext == 'odt') {
-      final xml = findText('content.xml');
-      if (xml != null) texts.add(_stripXml(xml));
-    } else if (ext == 'xlsx') {
-      final shared = findText('xl/sharedStrings.xml');
-      if (shared != null) texts.add(_stripXml(shared));
-      for (final f in archive.files) {
-        if (f.name.startsWith('xl/worksheets/sheet') &&
-            f.name.endsWith('.xml') && f.content != null) {
-          texts.add(_stripXml(
-              utf8.decode(f.content as List<int>, allowMalformed: true)));
-        }
-      }
-    } else if (ext == 'pptx') {
-      for (final f in archive.files) {
-        if (f.name.startsWith('ppt/slides/slide') &&
-            f.name.endsWith('.xml') && f.content != null) {
-          texts.add(_stripXml(
-              utf8.decode(f.content as List<int>, allowMalformed: true)));
-        }
-      }
-    }
-    return texts.join(' ').trim();
-  } catch (_) {
-    return '';
-  }
-}
-
-Future<String> extractText(File file, String ext) async {
-  try {
-    final bytes = await file.readAsBytes();
-    if (ext == 'txt' || ext == 'md' || ext == 'csv' || ext == 'log') {
-      return utf8.decode(bytes, allowMalformed: true);
-    }
-    if (ext == 'pdf') return _extractPdfText(bytes);
-    if (ext == 'docx' || ext == 'odt' || ext == 'xlsx' || ext == 'pptx') {
-      return _extractOfficeText(bytes, ext);
-    }
-    // Other binaries: date-only names, no invented text.
-    return '';
-  } catch (_) {
-    return '';
-  }
-}
-
-// ------------------------------------------------------------------- Ollama
-
-bool dateAppearsInContent(String content, DateTime dt) {
-  final c = content.toLowerCase();
-  final day = dt.day.toString();
-  final year = dt.year.toString();
-  final mon = _months[dt.month - 1].toLowerCase();
-  final monFull = _monthNames[dt.month - 1].toLowerCase();
-  if (!c.contains(year)) return false;
-  if (!c.contains(mon) && !c.contains(monFull)) return false;
-  // Day as a standalone-ish number near the month is approximated by the
-  // day string appearing at all (plus year+month present) — the egui app
-  // verifies dates against content the same way, and strips on failure.
-  if (!c.contains(day)) return false;
-  return true;
-}
-
-bool titleWordsInContent(String title, String content) {
-  final c = content.toLowerCase();
-  final words = title
-      .toLowerCase()
-      .split(RegExp(r'[^a-z0-9]+'))
-      .where((w) => w.length > 2)
-      .toList();
-  if (words.isEmpty) return false;
-  final hits = words.where((w) => c.contains(w)).length;
-  if (words.length <= 3) return hits == words.length;
-  return hits / words.length >= 0.7;
-}
-
-DateTime? parseDocDate(String s) {
-  // Accepts "26-Oct-2026", "26 Oct 2026", "2026-10-26", "10/26/2026".
-  final m1 = RegExp(r'(\d{1,2})[ -]([A-Za-z]{3,9})[ -](\d{4})').firstMatch(s);
-  if (m1 != null) {
-    final monStr = m1[2]!.toLowerCase();
-    var mon = _months.indexWhere((m) => m.toLowerCase() == monStr.substring(0, 3));
-    if (mon < 0) {
-      mon = _monthNames.indexWhere((m) => m.toLowerCase() == monStr);
-    }
-    if (mon >= 0) {
-      try {
-        return DateTime(int.parse(m1[3]!), mon + 1, int.parse(m1[1]!));
-      } catch (_) {}
-    }
-  }
-  final m2 = RegExp(r'(\d{4})-(\d{2})-(\d{2})').firstMatch(s);
-  if (m2 != null) {
-    try {
-      return DateTime(int.parse(m2[1]!), int.parse(m2[2]!), int.parse(m2[3]!));
-    } catch (_) {}
-  }
-  return null;
-}
-
-Future<Map<String, dynamic>?> _ollamaOnce(
-    Settings s, String text, double temp) async {
-  final url = s.ollamaUrl.replaceAll(RegExp(r'/+$'), '');
-  final prompt = '''You name documents from their contents. Read the document
-below and return ONLY a JSON object: {"title": "...", "date": "DD-Mon-YYYY or null"}.
-Rules: the title must be the document's subject, or sender + document type
-(e.g. "Screening Notification"), NEVER a field label from the document
-(such as "Name", "Date", "Address"). Use Title Case. The date must be a
-date actually written in the document, or null if none is written. Never
-invent a date or a title.
-
-Document (truncated):
-${text.length > 4000 ? text.substring(0, 4000) : text}''';
-  final resp = await http
-      .post(
-        Uri.parse('$url/api/chat'),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({
-          'model': s.model,
-          'stream': false,
-          'options': {'temperature': temp},
-          'messages': [
-            {'role': 'user', 'content': prompt}
-          ],
-        }),
-      )
-      .timeout(const Duration(seconds: 120));
-  if (resp.statusCode != 200) return null;
-  final body = jsonDecode(resp.body) as Map<String, dynamic>;
-  final content =
-      ((body['message'] as Map<String, dynamic>?)?['content'] as String?) ?? '';
-  final jm = RegExp(r'\{[^}]*\}').firstMatch(content);
-  if (jm == null) return null;
-  try {
-    return jsonDecode(jm.group(0)!) as Map<String, dynamic>;
-  } catch (_) {
-    return null;
-  }
-}
-
-/// Returns (title, date-or-null, statusNote).
-Future<(String?, DateTime?, String)> proposeDocument(
-    Settings s, File file, String ext, {bool forceReroll = false}) async {
-  final text = await extractText(file, ext);
-  if (text.trim().isEmpty) return (null, null, 'No text layer — date fallback');
-  // Normal path: 0.2, re-roll at 0.7 only if the title guard fails.
-  // New name (single-file dialog): force the 0.7 re-roll, like egui.
-  final temps = forceReroll ? [0.7] : [0.2, 0.7];
-  for (final temp in temps) {
-    Map<String, dynamic>? out;
-    try {
-      out = await _ollamaOnce(s, text, temp);
-    } catch (_) {
-      return (null, null, 'Ollama unavailable — date fallback');
-    }
-    if (out == null) continue;
-    final rawTitle = (out['title'] as String?)?.trim() ?? '';
-    if (rawTitle.isEmpty) continue;
-    if (!titleWordsInContent(rawTitle, text)) continue; // guard: re-roll
-    final title = _titleCase(rawTitle);
-    DateTime? date;
-    final rawDate = out['date'] as String?;
-    if (rawDate != null && rawDate.toLowerCase() != 'null') {
-      final parsed = parseDocDate(rawDate);
-      if (parsed != null && dateAppearsInContent(text, parsed)) {
-        date = parsed;
-      } // else: strip the date, keep the title (guard)
-    }
-    return (title, date, temp == 0.7 ? 'Re-rolled' : 'AI named');
-  }
-  return (null, null, 'AI could not verify title — date fallback');
-}
+// ------------------------------------------------------------- Rust core
+// Naming, extraction, and Ollama logic are NOT implemented in Dart.
+// They live in rust/src/lib.rs (extracted from the egui app) and are
+// called through lib/rust_bridge.dart via FFI. The Dart formatter
+// above (formatPhotoName / formatDocDate) is used only for the
+// Settings live preview and is never used for actual naming.
 
 // --------------------------------------------------------------- file items
 
@@ -624,6 +207,7 @@ class FileItem {
   String status = 'Pending';
   String source = '';
   bool alreadyCorrect = false;
+  bool proposeError = false;
   final controllers = <String, TextEditingController>{};
 
   FileItem(this.file);
@@ -722,26 +306,14 @@ class _HomePageState extends State<HomePage> {
       ollamaStatus = 'Checking…';
     });
     try {
-      final url = settings.ollamaUrl.replaceAll(RegExp(r'/+$'), '');
-      final resp = await http
-          .get(Uri.parse('$url/api/tags'))
-          .timeout(const Duration(seconds: 10));
-      if (resp.statusCode == 200) {
-        final body = jsonDecode(resp.body) as Map<String, dynamic>;
-        final models = ((body['models'] as List?) ?? [])
-            .map((m) => (m as Map<String, dynamic>)['name'] as String? ?? '')
-            .where((n) => n.isNotEmpty)
-            .toList();
-        setState(() {
-          ollamaModels = models;
-          ollamaStatus = 'Ollama running — ${models.length} model(s) installed';
-          ollamaSetupLog = models.isEmpty
-              ? 'No models installed yet.'
-              : 'Installed: ${models.join(', ')}';
-        });
-      } else {
-        setState(() => ollamaStatus = 'Ollama returned HTTP ${resp.statusCode}');
-      }
+      final models = await RustBridge.checkModels(settings.ollamaUrl);
+      setState(() {
+        ollamaModels = models;
+        ollamaStatus = 'Ollama running — ${models.length} model(s) installed';
+        ollamaSetupLog = models.isEmpty
+            ? 'No models installed yet.'
+            : 'Installed: ${models.join(', ')}';
+      });
     } catch (_) {
       setState(() {
         ollamaStatus = 'Ollama not running / not installed';
@@ -773,19 +345,8 @@ class _HomePageState extends State<HomePage> {
       ollamaSetupLog = 'Downloading Ollama installer…';
     });
     try {
-      final tmp = await getTemporaryDirectory();
-      final dest = File(p.join(tmp.path, 'OllamaSetup.exe'));
-      final client = http.Client();
-      final req = http.Request(
-          'GET', Uri.parse('https://ollama.com/download/OllamaSetup.exe'));
-      final resp = await client.send(req);
-      if (resp.statusCode != 200) {
-        setState(() { ollamaSetupLog = 'Download failed: HTTP ${resp.statusCode}'; ollamaBusy = false; });
-        return;
-      }
-      final sink = dest.openWrite();
-      await resp.stream.pipe(sink);
-      await Process.start(dest.path, []);
+      final path = await RustBridge.downloadOllamaInstaller();
+      await Process.start(path, []);
       setState(() => ollamaSetupLog =
           'Ollama installer launched — complete its steps, then come back and Check again.');
     } catch (e) {
@@ -800,40 +361,8 @@ class _HomePageState extends State<HomePage> {
       ollamaSetupLog = 'Pulling $model…';
     });
     try {
-      final url = settings.ollamaUrl.replaceAll(RegExp(r'/+$'), '');
-      final client = http.Client();
-      final req = http.Request('POST', Uri.parse('$url/api/pull'))
-        ..headers['Content-Type'] = 'application/json'
-        ..body = jsonEncode({'name': model, 'stream': true});
-      final resp = await client.send(req);
-      if (resp.statusCode != 200) {
-        setState(() { ollamaSetupLog = 'Pull failed: HTTP ${resp.statusCode}'; ollamaBusy = false; });
-        return;
-      }
-      var done = false;
-      await for (final line in resp.stream
-          .transform(utf8.decoder)
-          .transform(const LineSplitter())) {
-        if (line.trim().isEmpty) continue;
-        try {
-          final v = jsonDecode(line) as Map<String, dynamic>;
-          if (v['error'] != null) {
-            setState(() { ollamaSetupLog = 'Pull failed: ${v['error']}'; ollamaBusy = false; });
-            return;
-          }
-          final status = (v['status'] as String?) ?? '';
-          final completed = (v['completed'] as num?)?.toDouble() ?? 0;
-          final total = (v['total'] as num?)?.toDouble() ?? 0;
-          setState(() => ollamaSetupLog = total > 0
-              ? 'Pulling $model — $status ${(completed / total * 100).toStringAsFixed(0)}%'
-              : 'Pulling $model — $status');
-          if (status == 'success') {
-            done = true;
-            break;
-          }
-        } catch (_) {}
-      }
-      setState(() => ollamaSetupLog = done ? 'Pulled $model.' : 'Pulled $model (stream ended).');
+      await RustBridge.pullModel(settings.ollamaUrl, model);
+      setState(() => ollamaSetupLog = 'Pulled $model.');
       await _checkOllama();
     } catch (e) {
       setState(() => ollamaSetupLog = 'Pull failed: $e');
@@ -875,72 +404,38 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _proposeOne(FileItem item, {bool reroll = false}) async {
-    final kind = kindForExt(item.ext);
+    // Naming, extraction, and Ollama behaviour come from the Rust core
+    // (rust/src/lib.rs, extracted from the egui app) via FFI — not
+    // from Dart logic. That is what makes file Created time, PDF/Office
+    // extraction, and AI OCR for image-only PDFs work exactly like egui.
     try {
-      if (kind == FileKind.photo || kind == FileKind.video) {
-        DateTime? exif;
-        var hasRealExif = false;
-        var hasMediaDate = false;
-        if (kind == FileKind.photo) {
-          exif = await parseExifDateTimeOriginal(item.file);
-          hasRealExif = exif != null;
-        } else {
-          exif = await parseMp4Creation(item.file);
-          hasMediaDate = exif != null;
-        }
-        final stat = await item.file.stat();
-        final modified = stat.modified;
-        final candidates = <DateTime>[];
-        if (exif != null) candidates.add(exif);
-        candidates.add(modified);
-        DateTime chosen;
-        if (settings.timestampSource == 'latest') {
-          chosen = candidates.reduce((a, b) => a.isAfter(b) ? a : b);
-        } else if (settings.timestampSource == 'exif-only') {
-          chosen = exif ?? modified;
-        } else {
-          chosen = candidates.reduce((a, b) => a.isBefore(b) ? a : b);
-        }
-        if (kind == FileKind.video) {
-          chosen = DateTime(chosen.year, chosen.month, chosen.day,
-              chosen.hour, chosen.minute, 0);
-        }
-        final datePart = formatPhotoName(chosen, settings, hasRealExif);
-        item.proposed = '${settings.prefix}$datePart${settings.suffix}';
-        item.status = kind == FileKind.photo
-            ? (hasRealExif ? 'Date-based (EXIF)' : 'Date-based (file date)')
-            : 'Date-based (video)';
-        item.source = kind == FileKind.photo
-            ? (hasRealExif ? 'EXIF date taken' : 'file date')
-            : (hasMediaDate ? 'embedded media-created date' : 'file date');
-      } else if (kind == FileKind.document) {
-        item.status = 'Proposing…';
-        setState(() {});
-        final (title, date, note) = await proposeDocument(
-            settings, item.file, item.ext, forceReroll: reroll);
-        if (title != null) {
-          item.proposed = date != null
-              ? '${settings.prefix}$title${settings.suffix}_${formatDocDate(date)}'
-              : '${settings.prefix}$title${settings.suffix}';
-          item.status = note;
-        } else {
-          final stat = await item.file.stat();
-          item.proposed =
-              '${settings.prefix}${formatPhotoName(stat.modified, settings, false)}${settings.suffix}';
-          item.status = note;
-        }
+      item.status = 'Proposing…';
+      setState(() {});
+      final configJson = jsonEncode(settings.toJson());
+      final result = await RustBridge.propose(
+          item.file.path, configJson, reroll ? 1 : 0);
+      final kind = result['kind'] as String? ?? 'error';
+      if (kind == 'date') {
+        item.proposed = result['proposed'] as String? ?? '';
+        item.source = result['date_source'] as String? ?? '';
+        item.status = 'Date-based (${item.source})';
+        item.proposeError = false;
+      } else if (kind == 'document') {
+        item.proposed = result['proposed'] as String? ?? '';
+        item.status = reroll ? 'Re-rolled' : 'AI named';
         item.source = item.status;
+        item.proposeError = false;
       } else {
-        final stat = await item.file.stat();
-        item.proposed =
-            '${settings.prefix}${formatPhotoName(stat.modified, settings, false)}${settings.suffix}';
-        item.status = 'Date-based (other file)';
-        item.source = 'file date';
+        item.proposed = item.stem;
+        item.status = (result['error'] as String?) ?? 'Naming failed';
+        item.source = '';
+        item.proposeError = true;
       }
     } catch (e) {
       item.proposed = item.stem;
       item.status = 'Error: $e';
       item.source = '';
+      item.proposeError = true;
     }
     item.finalName = item.proposed +
         (item.ext.isEmpty ? '' : '.${item.ext}');
@@ -959,34 +454,46 @@ class _HomePageState extends State<HomePage> {
       await _proposeOne(item);
     }
 
-    // Already-correct detection + collisions.
-    final used = <String>{};
-    for (final item in items) {
-      final extPart = item.ext.isEmpty ? '' : '.${item.ext}';
-      if (stripTrailingSuffix(item.stem) == stripTrailingSuffix(item.proposed) &&
-          item.stem == item.proposed ||
-          stripTrailingSuffix(item.stem) == item.proposed) {
-        // Already correct (trailing _N ignored).
-        item.alreadyCorrect = true;
-        item.finalName = item.baseName;
-        item.status = 'Already correct — left alone';
-        used.add(item.stem);
-        continue;
-      }
-      item.alreadyCorrect = false;
-      var candidate = item.proposed;
-      if (settings.collisionSuffix) {
-        var n = 1;
-        final dir = p.dirname(item.file.path);
-        while (used.contains(candidate) ||
-            (File(p.join(dir, '$candidate$extPart')).existsSync() &&
-                p.join(dir, '$candidate$extPart') != item.file.path)) {
-          candidate = '${item.proposed}_$n';
-          n++;
+    // Already-correct detection + collisions, via the Rust core
+    // (egui resolve_batch): date rows use the advanced collision style,
+    // document rows keep "_1", already-correct names are left alone.
+    try {
+      final rows = items.map((item) {
+        final kind = kindForExt(item.ext);
+        final isDate = kind == FileKind.photo || kind == FileKind.video;
+        return {
+          'path': item.file.path,
+          'current_name': item.baseName,
+          'ext': item.ext,
+          'proposed': item.proposed,
+          'ready': !item.proposeError && item.proposed.isNotEmpty,
+          'error': item.proposeError,
+          'date_source': isDate ? item.source : null,
+        };
+      }).toList();
+      final resolved = RustBridge.resolveBatch(jsonEncode({
+        'photo_collision_suffix': settings.collisionSuffix ? '_1' : '',
+        'rows': rows,
+      }));
+      final results = (resolved['results'] as List?) ?? [];
+      for (var i = 0; i < items.length && i < results.length; i++) {
+        final item = items[i];
+        final r = results[i] as Map<String, dynamic>;
+        final status = r['status'] as String? ?? 'ready';
+        if (status == 'noop') {
+          item.alreadyCorrect = true;
+          item.finalName = item.baseName;
+          item.status = 'Already correct — left alone';
+        } else if (status == 'ready') {
+          item.alreadyCorrect = false;
+          item.finalName = r['final_name'] as String? ?? item.finalName;
+        } else if (status == 'error') {
+          item.alreadyCorrect = false;
+          item.finalName = item.baseName;
         }
       }
-      used.add(candidate);
-      item.finalName = '$candidate$extPart';
+    } catch (e) {
+      _setLog('Collision resolution failed ($e) — final names are the proposed names.');
     }
 
     setState(() => processing = false);
@@ -1095,11 +602,10 @@ class _HomePageState extends State<HomePage> {
   Future<void> _checkMenu() async {
     if (!Platform.isWindows) return;
     try {
-      final r = await Process.run(
-          'reg', ['query', r'HKCU\Software\Classes\*\shell\FileNamerAI']);
+      final installed = RustBridge.menuInstalled();
       setState(() {
-        menuInstalled = r.exitCode == 0;
-        menuStatus = menuInstalled
+        menuInstalled = installed;
+        menuStatus = installed
             ? 'Right-click menu: installed.'
             : 'Right-click menu: not installed.';
       });
@@ -1111,15 +617,7 @@ class _HomePageState extends State<HomePage> {
   Future<void> _addMenu() async {
     if (!Platform.isWindows) return;
     try {
-      final exe = Platform.resolvedExecutable;
-      await Process.run('reg', [
-        'add', r'HKCU\Software\Classes\*\shell\FileNamerAI',
-        '/ve', '/d', 'Rename with File Namer AI', '/f'
-      ]);
-      await Process.run('reg', [
-        'add', r'HKCU\Software\Classes\*\shell\FileNamerAI\command',
-        '/ve', '/d', '"$exe" "%1"', '/f'
-      ]);
+      await RustBridge.installMenu(Platform.resolvedExecutable);
       setState(() => menuStatus = 'Right-click menu: installed.');
       await _checkMenu();
     } catch (e) {
@@ -1130,9 +628,7 @@ class _HomePageState extends State<HomePage> {
   Future<void> _removeMenu() async {
     if (!Platform.isWindows) return;
     try {
-      await Process.run('reg', [
-        'delete', r'HKCU\Software\Classes\*\shell\FileNamerAI', '/f'
-      ]);
+      await RustBridge.uninstallMenu();
       setState(() => menuStatus = 'Right-click menu: removed.');
       await _checkMenu();
     } catch (e) {
@@ -1641,14 +1137,14 @@ class _HomePageState extends State<HomePage> {
       const Text(
           '• By default, videos use the embedded media-created date, always truncated to the minute (:00).'),
       const Text(
-          '• By default, if the dates disagree, the earliest one wins (EXIF/media date, file Created, file Modified). Note: Dart does not expose file Created on all platforms, so this build uses EXIF + Modified only.'),
+          '• By default, if the dates disagree, the earliest one wins (EXIF/media date, file Created, file Modified). Note: naming uses the Rust core, so file Created time works exactly like egui.'),
       const Text(
           '• Two files sharing a timestamp get a collision suffix (_1, _2 by default); already-correct names are left alone.'),
       const Text(
           '• The Advanced photo/video naming section above can change any of these defaults.'),
       const SizedBox(height: 16),
       const Text(
-        'Gaps: AI OCR for image-only PDFs, Mac build, and automatic updater are NOT implemented yet. Settings are saved on disk and reloaded on launch.',
+        'Gaps: Mac build and automatic updater are NOT implemented yet. AI OCR for image-only PDFs now works via the Rust core (Ollama vision model), and file Created time works via Rust. Settings are saved on disk and reloaded on launch.',
         style: TextStyle(color: Colors.grey),
       ),
       if (!_settingsLoaded) const Text('Loading saved settings…'),

@@ -1,0 +1,20 @@
+[package]
+name = "filenamer_core"
+version = "1.4.0"
+edition = "2021"
+license = "GPL-3.0-only"
+
+[lib]
+name = "filenamer_core"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+chrono = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+pdf-extract = "0.7"
+lopdf = "0.34"
+base64 = "0.22"
+exif = { package = "kamadak-exif", version = "0.5" }
+zip = "2"
