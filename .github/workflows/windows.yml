@@ -1,0 +1,48 @@
+name: Build Windows
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: Build Rust core (filenamer_core.dll)
+        run: cargo build --release --manifest-path rust/Cargo.toml
+      - name: Generate Windows runner and use repo app code
+        run: |
+          flutter create --platforms=windows --project-name filenamer_ai_flutter app
+          Copy-Item -Force -Recurse lib/* app/lib/
+          Copy-Item -Force pubspec.yaml app/pubspec.yaml
+      - name: Build Windows release
+        run: |
+          cd app
+          flutter pub get
+          flutter build windows --release
+      - name: Copy Rust core DLL into the Release folder
+        run: |
+          Copy-Item -Force rust/target/release/filenamer_core.dll app/build/windows/x64/runner/Release/
+          if (-not (Test-Path 'app/build/windows/x64/runner/Release/filenamer_core.dll')) { throw 'filenamer_core.dll missing — Rust core build failed, do not ship a pure-Dart build' }
+          Get-ChildItem app/build/windows/x64/runner/Release/
+      - name: Zip the Release folder (exe alone will not run)
+        run: |
+          Compress-Archive -Path app/build/windows/x64/runner/Release/* -DestinationPath FileNamerAI-Windows.zip
+      - name: Build NSIS installer
+        run: |
+          if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) { choco install nsis -y }
+          Copy-Item -Recurse -Force app/build/windows/x64/runner/Release installer/staging
+          cd installer
+          makensis installer.nsi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: file-namer-ai-windows
+          path: |
+            FileNamerAI-Windows.zip
+            installer/FileNamerAI-Setup-v1.4.0.exe
