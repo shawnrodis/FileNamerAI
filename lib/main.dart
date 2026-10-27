@@ -51,7 +51,7 @@ import 'rust_bridge.dart';
 
 // ---------------------------------------------------------------- settings
 
-const String appVersion = '1.4.4';
+const String appVersion = '1.4.5';
 
 class Settings {
   String ollamaUrl;
@@ -876,8 +876,11 @@ class _HomePageState extends State<HomePage> {
         } else if (tag == current) {
           setState(() => updateStatus = 'Up to date (v$current).');
         } else {
-          // Installer asset only, exact name — never a zip or a stray file.
-          final expected = 'FileNamerAI-Setup-v$tag.exe';
+          // Exact asset name, per platform — never a zip or a stray file.
+          // Windows: the NSIS installer. macOS: the DMG.
+          final expected = Platform.isMacOS
+              ? 'FileNamerAI-v$tag.dmg'
+              : 'FileNamerAI-Setup-v$tag.exe';
           Map<String, dynamic>? asset;
           for (final a in (body['assets'] as List?) ?? []) {
             if (a is Map<String, dynamic> && a['name'] == expected) {
@@ -887,7 +890,7 @@ class _HomePageState extends State<HomePage> {
           }
           if (asset == null) {
             setState(() => updateStatus =
-                'Update available: $tag (you have v$current) — installer not found on the releases page.');
+                'Update available: $tag (you have v$current) — update file not found on the releases page.');
           } else {
             // Extract before setState: a captured nullable local is
             // not promoted inside the setState closure.
@@ -912,11 +915,6 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _downloadAndInstallUpdate() async {
     if (updateAssetUrl.isEmpty || updateAssetName.isEmpty) return;
-    if (!Platform.isWindows) {
-      setState(() => updateStatus =
-          'Auto-install is Windows only — download it from the releases page.');
-      return;
-    }
     setState(() {
       updateDownloading = true;
       updateProgress = 0;
@@ -934,16 +932,22 @@ class _HomePageState extends State<HomePage> {
       }
       // Verify before launching: a redirect/error page or truncated file
       // must never be run as an installer, and must never exit the app.
-      if (chunks.isEmpty ||
-          chunks.length < 2 ||
-          chunks[0] != 0x4D ||
-          chunks[1] != 0x5A ||
-          (total > 0 && got != total)) {
-        throw StateError('Download verification failed');
-      }
-      final dest =
-          File('${Directory.systemTemp.path}\\${updateAssetName}');
+      // Windows: the installer must start with MZ. macOS: a DMG has no
+      // MZ header, so the check there is non-empty + exact size.
+      final isMac = Platform.isMacOS;
+      final verified = isMac
+          ? (chunks.isNotEmpty && (total <= 0 || got == total))
+          : (chunks.length >= 2 &&
+              chunks[0] == 0x4D &&
+              chunks[1] == 0x5A &&
+              (total <= 0 || got == total));
+      if (!verified) throw StateError('Download verification failed');
+      final dest = File(p.join(Directory.systemTemp.path, updateAssetName));
       await dest.writeAsBytes(chunks);
+      if (isMac) {
+        await _installMacUpdate(dest);
+        return; // _installMacUpdate exits the app after launching the script.
+      }
       setState(() =>
           updateStatus = 'Downloaded ${updateAssetName} — launching installer…');
       // Do NOT run the installer directly: it would try to replace the
@@ -964,6 +968,38 @@ class _HomePageState extends State<HomePage> {
         updateStatus = 'Download failed — check your connection and try again.';
       });
     }
+  }
+
+  // macOS install: same pattern as the Windows .bat, as a shell script.
+  // The script waits for this process to exit, mounts the DMG, replaces
+  // the .app bundle in place (wherever it actually lives, derived from
+  // the running executable — /Applications or anywhere else), opens
+  // the new app, then deletes the DMG and itself. Attach happens
+  // before any removal, so a failed mount leaves the old app intact.
+  Future<void> _installMacUpdate(File dmg) async {
+    final exe = Platform.resolvedExecutable;
+    final appBundle = p.dirname(p.dirname(p.dirname(exe)));
+    final script =
+        File(p.join(Directory.systemTemp.path, 'FileNamerAI-update.sh'));
+    final lines = <String>[
+      '#!/bin/bash',
+      'APP_PID="$pid"',
+      'DMG="${dmg.path}"',
+      'APP="$appBundle"',
+      'for i in \$(seq 1 30); do kill -0 "\$APP_PID" 2>/dev/null || break; sleep 1; done',
+      'MNT="\$(mktemp -d /tmp/FileNamerAI-update-mnt.XXXXXX)"',
+      'hdiutil attach "\$DMG" -nobrowse -mountpoint "\$MNT" >/dev/null 2>&1 || exit 1',
+      'rm -rf "\$APP"',
+      'cp -R "\$MNT/FileNamerAI.app" "\$APP"',
+      'hdiutil detach "\$MNT" >/dev/null 2>&1',
+      'open "\$APP"',
+      'rm -f "\$DMG" "\$0"',
+    ];
+    await script.writeAsString(lines.join('\n'));
+    setState(() =>
+        updateStatus = 'Downloaded ${dmg.path.split('/').last} — installing update…');
+    await Process.start('bash', [script.path]);
+    exit(0);
   }
 
   Future<void> _checkMenu() async {

@@ -75,11 +75,14 @@ jobs:
           # project (filenamer_ai_flutter) — same class of bug as the
           # Utility Closet v1.1.1 title fix, which patched
           # windows/runner/main.cpp. On macOS the title comes from the
-          # generated Runner instead, so patch all three places that
-          # can carry the slug: the MainMenu.xib window title, the
-          # MainFlutterWindow title at runtime, and the bundle name
-          # in Info.plist. Otherwise the Mac title bar reads the
-          # project slug instead of "File Namer AI".
+          # generated Runner instead, so patch every place that can
+          # carry the slug. v1.4.4 lesson: the current Flutter template
+          # has NO MainMenu.xib, so the awakeFromNib assignment never
+          # runs, and the Info.plist bundle name alone did not move
+          # the title bar either — the title follows the Xcode
+          # product name. So v1.4.5 also patches PRODUCT_NAME in
+          # project.pbxproj and sets the title in MainFlutterWindow's
+          # init paths (programmatic windows never hit awakeFromNib).
           python3 - << 'PYEOF'
           import pathlib, plistlib
           runner = pathlib.Path('app/macos/Runner')
@@ -94,13 +97,26 @@ jobs:
           swift = runner / 'MainFlutterWindow.swift'
           if swift.exists():
               t = swift.read_text()
-              if 'self.title = "File Namer AI"' not in t and 'super.awakeFromNib()' in t:
+              if 'super.awakeFromNib()' in t and 'self.title = "File Namer AI"' not in t:
                   t = t.replace('super.awakeFromNib()',
                                 'self.title = "File Namer AI"\n    super.awakeFromNib()', 1)
-                  swift.write_text(t)
-                  print('MainFlutterWindow.swift title set')
-              else:
-                  print('MainFlutterWindow.swift: title already set or pattern missing')
+                  print('MainFlutterWindow.swift awakeFromNib title set')
+              if 'override init(contentRect' not in t:
+                  methods = ('  override init(contentRect: NSRect, styleMask style: NSWindow.StyleMask, backing bufferingType: NSWindow.BackingStoreType, defer flag: Bool) {\n'
+                             '    super.init(contentRect: contentRect, styleMask: style, backing: bufferingType, defer: flag)\n'
+                             '    self.title = "File Namer AI"\n'
+                             '  }\n\n'
+                             '  required init?(coder: NSCoder) {\n'
+                             '    super.init(coder: coder)\n'
+                             '    self.title = "File Namer AI"\n'
+                             '  }\n\n')
+                  idx = t.rfind('\n}')
+                  if idx != -1:
+                      t = t[:idx] + '\n' + methods + t[idx + 1:]
+                      print('MainFlutterWindow.swift init titles set')
+                  else:
+                      print('MainFlutterWindow.swift: no class closing brace found')
+              swift.write_text(t)
           else:
               print('MainFlutterWindow.swift not found, skipping')
           plist = runner / 'Info.plist'
@@ -114,15 +130,37 @@ jobs:
               print('Info.plist bundle name set to File Namer AI')
           else:
               print('Info.plist not found, skipping')
+          pbx = pathlib.Path('app/macos/Runner.xcodeproj/project.pbxproj')
+          if pbx.exists():
+              t = pbx.read_text()
+              n = t.count('PRODUCT_NAME = filenamer_ai_flutter;')
+              t = t.replace('PRODUCT_NAME = filenamer_ai_flutter;',
+                            'PRODUCT_NAME = "File Namer AI";')
+              pbx.write_text(t)
+              print(f'PRODUCT_NAME patched ({n} occurrences)')
+          else:
+              print('project.pbxproj not found, skipping')
           PYEOF
           cd app
           flutter pub get
           flutter build macos --release
-          cp ../dist/libfilenamer_core.dylib build/macos/Build/Products/Release/filenamer_ai_flutter.app/Contents/Frameworks/
-          ls build/macos/Build/Products/Release/filenamer_ai_flutter.app/Contents/Frameworks/
+          # The .app name follows PRODUCT_NAME, so find it by glob
+          # instead of assuming filenamer_ai_flutter.app.
+          python3 - << 'PYEOF'
+          import glob
+          apps = glob.glob('build/macos/Build/Products/Release/*.app')
+          assert len(apps) == 1, f'expected one .app, found {apps}'
+          print(f'BUILT_APP={apps[0]}')
+          import pathlib
+          pathlib.Path('../built_app.txt').write_text(apps[0])
+          PYEOF
+          APP_PATH=$(cat ../built_app.txt)
+          cp ../dist/libfilenamer_core.dylib "$APP_PATH/Contents/Frameworks/"
+          ls "$APP_PATH/Contents/Frameworks/"
       - name: Ad-hoc codesign (deliberately unsigned)
         run: |
-          mv app/build/macos/Build/Products/Release/filenamer_ai_flutter.app dist/FileNamerAI.app
+          APP_PATH=$(cat built_app.txt)
+          mv "app/$APP_PATH" dist/FileNamerAI.app
           codesign --force --deep --sign - dist/FileNamerAI.app
           codesign --verify --verbose=2 dist/FileNamerAI.app
       - name: Build DMG and upload to the release

@@ -55,4 +55,4 @@ jobs:
           name: file-namer-ai-windows
           path: |
             FileNamerAI-Windows.zip
-            installer/FileNamerAI-Setup-v1.4.4.exe
+            installer/FileNamerAI-Setup-v1.4.5.exe
