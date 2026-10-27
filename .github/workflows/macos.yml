@@ -1,0 +1,96 @@
+# File Namer AI — macOS DMG builder (Flutter + Rust core).
+#
+# Deliberately unsigned (ad-hoc codesign), like the egui Mac builds
+# and the Tuya Mac builds: personal projects, no paid Apple
+# membership. Gatekeeper "Open Anyway" instructions stay in README.
+#
+# Trigger: manual dispatch only, so a Windows push does not also
+# rebuild the Mac app. Dispatch with the release tag that should
+# receive the DMG (e.g. v1.4.3 — the release already exists; this
+# workflow only uploads the DMG to it, it never creates a release).
+# Builds from master, so Mac-only fixes (like the Frameworks dylib
+# load path) land in the DMG even when the tag predates them.
+#
+# Pattern mirrors the egui release-mac.yml on egui-legacy and the
+# Tuya Flutter Mac workflow: universal Rust core dylib (arm64 +
+# x86_64, lipo'd), Flutter macOS app, dylib copied into
+# .app/Contents/Frameworks, icon regenerated from assets/icon.png,
+# ad-hoc codesign, hdiutil DMG, gh release upload.
+
+name: Build macOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing release tag to attach the DMG to (e.g. v1.4.3)"
+        required: true
+        type: string
+
+permissions:
+  contents: write # gh release upload
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: Build universal Rust core dylib
+        run: |
+          cargo build --release --manifest-path rust/Cargo.toml --target aarch64-apple-darwin
+          cargo build --release --manifest-path rust/Cargo.toml --target x86_64-apple-darwin
+          mkdir -p dist
+          lipo -create rust/target/aarch64-apple-darwin/release/libfilenamer_core.dylib rust/target/x86_64-apple-darwin/release/libfilenamer_core.dylib -output dist/libfilenamer_core.dylib
+          lipo -info dist/libfilenamer_core.dylib
+          if [ ! -f dist/libfilenamer_core.dylib ]; then echo "libfilenamer_core.dylib missing — do not ship a pure-Dart build" && exit 1; fi
+      - name: Build Flutter macOS app
+        run: |
+          flutter create --platforms=macos --project-name filenamer_ai_flutter app
+          cp -R lib/* app/lib/
+          cp pubspec.yaml app/pubspec.yaml
+          # Regenerate the macOS app icon from the repo's icon.png:
+          # read each appiconset entry's size x scale from
+          # Contents.json and sips the PNG to exactly that size
+          # (same upscaling approach the egui Mac workflow used).
+          python3 - << 'PYEOF'
+          import json, subprocess, pathlib
+          appiconset = list(pathlib.Path('app/macos/Runner/Assets.xcassets').glob('*.appiconset'))[0]
+          contents = json.loads((appiconset / 'Contents.json').read_text())
+          for img in contents['images']:
+              size = float(img['size'].split('x')[0])
+              scale = float(img['scale'].replace('x', ''))
+              px = int(size * scale)
+              fn = appiconset / img['filename']
+              subprocess.run(['sips', '-z', str(px), str(px), 'assets/icon.png', '--out', str(fn)],
+                             check=True, stdout=subprocess.DEVNULL)
+          print('app icon regenerated from assets/icon.png')
+          PYEOF
+          cd app
+          flutter pub get
+          flutter build macos --release
+          cp ../dist/libfilenamer_core.dylib build/macos/Build/Products/Release/filenamer_ai_flutter.app/Contents/Frameworks/
+          ls build/macos/Build/Products/Release/filenamer_ai_flutter.app/Contents/Frameworks/
+      - name: Ad-hoc codesign (deliberately unsigned)
+        run: |
+          mv app/build/macos/Build/Products/Release/filenamer_ai_flutter.app dist/FileNamerAI.app
+          codesign --force --deep --sign - dist/FileNamerAI.app
+          codesign --verify --verbose=2 dist/FileNamerAI.app
+      - name: Build DMG and upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          DMG="FileNamerAI-v${TAG#v}.dmg"
+          rm -rf dmgroot
+          mkdir dmgroot
+          cp -R dist/FileNamerAI.app dmgroot/
+          ln -s /Applications dmgroot/Applications
+          hdiutil create -volname "File Namer AI" -srcfolder dmgroot -ov -format UDZO "$DMG"
+          ls -la "$DMG"
+          gh release upload "$TAG" "$DMG" --clobber

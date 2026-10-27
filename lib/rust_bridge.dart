@@ -58,6 +58,21 @@ class RustBridge {
       return ffi.DynamicLibrary.open('filenamer_core.dll');
     }
     if (Platform.isMacOS) {
+      // A bare dlopen name is not reliably resolved from inside a
+      // macOS .app bundle, so try the bundle's Frameworks folder
+      // first (…/Contents/Frameworks/libfilenamer_core.dylib, next to
+      // …/Contents/MacOS/<exe>) and fall back to the bare name.
+      try {
+        final exe = Platform.resolvedExecutable;
+        final marker = '/Contents/MacOS/';
+        final idx = exe.indexOf(marker);
+        if (idx >= 0) {
+          final fw = '${exe.substring(0, idx)}/Contents/Frameworks/libfilenamer_core.dylib';
+          if (File(fw).existsSync()) {
+            return ffi.DynamicLibrary.open(fw);
+          }
+        }
+      } catch (_) {}
       return ffi.DynamicLibrary.open('libfilenamer_core.dylib');
     }
     return ffi.DynamicLibrary.open('libfilenamer_core.so');
