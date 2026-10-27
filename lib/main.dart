@@ -438,8 +438,8 @@ class _HomePageState extends State<HomePage> {
         _settingsLoaded = true;
       });
       if (widget.initialPaths.isNotEmpty) {
-        await _addPaths(widget.initialPaths);
-        if (items.isNotEmpty) await _proposeAll();
+        final added = await _addPaths(widget.initialPaths);
+        await _proposeItems(added);
       }
     });
     if (Platform.isWindows) _checkMenu();
@@ -541,23 +541,26 @@ class _HomePageState extends State<HomePage> {
     if (mounted) setState(() => log = s);
   }
 
-  Future<void> _addPaths(List<String> paths) async {
-    var added = 0;
+  Future<List<FileItem>> _addPaths(List<String> paths) async {
+    final added = <FileItem>[];
     for (final path in paths) {
       final f = File(path);
       if (!await f.exists()) continue;
       if (items.any((it) => it.file.path == path)) continue;
-      items.add(FileItem(f));
-      added++;
+      final item = FileItem(f);
+      items.add(item);
+      added.add(item);
     }
     setState(() {});
-    _setLog(added > 0 ? 'Added $added file(s). Press Propose Names.' : 'No new files added.');
+    _setLog(added.isNotEmpty ? 'Added ${added.length} file(s).' : 'No new files added.');
+    return added;
   }
 
   Future<void> _pickFiles() async {
     final result = await FilePicker.platform.pickFiles(allowMultiple: true);
     if (result == null) return;
-    await _addPaths(result.paths.whereType<String>().toList());
+    final added = await _addPaths(result.paths.whereType<String>().toList());
+    await _proposeItems(added);
   }
 
   Future<void> _proposeOne(FileItem item, {bool reroll = false}) async {
@@ -598,19 +601,29 @@ class _HomePageState extends State<HomePage> {
         (item.ext.isEmpty ? '' : '.${item.ext}');
   }
 
+  Future<void> _proposeItems(List<FileItem> toPropose) async {
+    if (toPropose.isEmpty) return;
+    setState(() {
+      processing = true;
+      renameDone = false;
+    });
+    for (final item in toPropose) {
+      await _proposeOne(item);
+    }
+    await _resolveBatch();
+    setState(() => processing = false);
+    _setLog('Proposed names for ${toPropose.length} file(s). Edit Final Name, then Rename All.');
+  }
+
   Future<void> _proposeAll() async {
     if (items.isEmpty) {
       _setLog('No files to name.');
       return;
     }
-    setState(() {
-      processing = true;
-      renameDone = false;
-    });
-    for (final item in items) {
-      await _proposeOne(item);
-    }
+    await _proposeItems(List<FileItem>.from(items));
+  }
 
+  Future<void> _resolveBatch() async {
     // Already-correct detection + collisions, via the Rust core
     // (egui resolve_batch): date rows use the advanced collision style,
     // document rows keep "_1", already-correct names are left alone.
@@ -652,9 +665,6 @@ class _HomePageState extends State<HomePage> {
     } catch (e) {
       _setLog('Collision resolution failed ($e) — final names are the proposed names.');
     }
-
-    setState(() => processing = false);
-    _setLog('Proposed names for ${items.length} file(s). Edit Final Name, then Rename All.');
   }
 
   Future<void> _renameSingle(FileItem item) async {
@@ -821,7 +831,9 @@ class _HomePageState extends State<HomePage> {
         padding: const EdgeInsets.all(12),
         child: DropTarget(
           onDragDone: (detail) async {
-            await _addPaths(detail.files.map((f) => f.path).toList());
+            final added =
+                await _addPaths(detail.files.map((f) => f.path).toList());
+            await _proposeItems(added);
           },
           child: Container(
             height: 110,
