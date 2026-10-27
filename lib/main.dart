@@ -365,12 +365,21 @@ String stripTrailingSuffix(String stem) {
 
 // ---------------------------------------------------------------------- UI
 
-void main() {
-  runApp(const FileNamerApp());
+void main(List<String> args) {
+  // Right-click (and any shell launch) passes file paths as arguments.
+  // Flutter desktop delivers them via main's args; fall back to
+  // Platform.executableArguments as well, in case the engine route
+  // differs. Flags are dropped, files are filtered in _addPaths.
+  final initial = <String>{};
+  for (final a in [...args, ...Platform.executableArguments]) {
+    if (!a.startsWith('-')) initial.add(a);
+  }
+  runApp(FileNamerApp(initialPaths: initial.toList()));
 }
 
 class FileNamerApp extends StatelessWidget {
-  const FileNamerApp({super.key});
+  final List<String> initialPaths;
+  const FileNamerApp({super.key, this.initialPaths = const []});
 
   @override
   Widget build(BuildContext context) {
@@ -386,13 +395,14 @@ class FileNamerApp extends StatelessWidget {
         useMaterial3: true,
       ),
       themeMode: ThemeMode.system,
-      home: const HomePage(),
+      home: HomePage(initialPaths: initialPaths),
     );
   }
 }
 
 class HomePage extends StatefulWidget {
-  const HomePage({super.key});
+  final List<String> initialPaths;
+  const HomePage({super.key, this.initialPaths = const []});
 
   @override
   State<HomePage> createState() => _HomePageState();
@@ -421,11 +431,16 @@ class _HomePageState extends State<HomePage> {
   @override
   void initState() {
     super.initState();
-    loadSettings().then((s) {
-      if (mounted) setState(() {
+    loadSettings().then((s) async {
+      if (!mounted) return;
+      setState(() {
         settings = s;
         _settingsLoaded = true;
       });
+      if (widget.initialPaths.isNotEmpty) {
+        await _addPaths(widget.initialPaths);
+        if (items.isNotEmpty) await _proposeAll();
+      }
     });
     if (Platform.isWindows) _checkMenu();
     _checkUpdates();
@@ -1077,7 +1092,7 @@ class _HomePageState extends State<HomePage> {
             'Use Ollama vision OCR even when a PDF already has a text layer. Off = OCR only for image-only PDFs.'),
         value: settings.forceOcr,
         onChanged: (v) {
-          setState(() => settings.forceOcr = v);
+          if (v != null) setState(() => settings.forceOcr = v);
           _save();
         },
       ),
@@ -1087,7 +1102,7 @@ class _HomePageState extends State<HomePage> {
             'Documents get _DD-Mon-YYYY, checked against the document itself.'),
         value: settings.appendDate,
         onChanged: (v) {
-          setState(() => settings.appendDate = v);
+          if (v != null) setState(() => settings.appendDate = v);
           _save();
         },
       ),
@@ -1097,7 +1112,7 @@ class _HomePageState extends State<HomePage> {
             'Overrides "Append date" above: document names keep their stem, no date added.'),
         value: settings.neverDates,
         onChanged: (v) {
-          setState(() => settings.neverDates = v);
+          if (v != null) setState(() => settings.neverDates = v);
           _save();
         },
       ),
@@ -1218,7 +1233,7 @@ class _HomePageState extends State<HomePage> {
             title: const Text('Include time'),
             value: settings.timeOn,
             onChanged: (v) {
-              setState(() => settings.timeOn = v);
+              if (v != null) setState(() => settings.timeOn = v);
               _save();
             },
           ),
