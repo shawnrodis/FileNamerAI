@@ -21,6 +21,9 @@ jobs:
           flutter create --platforms=windows --project-name filenamer_ai_flutter app
           Copy-Item -Force -Recurse lib/* app/lib/
           Copy-Item -Force pubspec.yaml app/pubspec.yaml
+          if (Test-Path assets/FileNamerAI.ico) {
+            Copy-Item -Force assets/FileNamerAI.ico app/windows/runner/resources/app_icon.ico
+          }
           # Window title: flutter create names the native window after the
           # project (filenamer_ai_flutter) — replace it with the app name.
           $mainCpp = 'app/windows/runner/main.cpp'
@@ -52,4 +55,4 @@ jobs:
           name: file-namer-ai-windows
           path: |
             FileNamerAI-Windows.zip
-            installer/FileNamerAI-Setup-v1.4.0.exe
+            installer/FileNamerAI-Setup-v1.4.1.exe

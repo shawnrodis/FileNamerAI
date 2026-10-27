@@ -8,7 +8,7 @@
 ; flutter_assets) must all be installed together.
 
 !define APP_NAME "File Namer AI"
-!define APP_VERSION "1.4.0"
+!define APP_VERSION "1.4.1"
 !define APP_PUBLISHER "Shawn Rodis"
 !define APP_URL "https://github.com/shawnrodis/FileNamerAI"
 

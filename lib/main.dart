@@ -51,6 +51,8 @@ import 'rust_bridge.dart';
 
 // ---------------------------------------------------------------- settings
 
+const String appVersion = '1.4.1';
+
 class Settings {
   String ollamaUrl;
   String model;
@@ -60,7 +62,7 @@ class Settings {
   bool timeOn;
   String secondsRule; // 'auto', 'keep', 'truncate'
   String timestampSource; // 'earliest', 'latest', 'exif-only'
-  bool collisionSuffix;
+  String collisionStyle; // '_1', '-1', '(1)', or '' (none)
   String prefix;
   String suffix;
   // Document-naming options from the egui app (Rust core reads all
@@ -84,7 +86,7 @@ class Settings {
     this.timeOn = true,
     this.secondsRule = 'auto',
     this.timestampSource = 'earliest',
-    this.collisionSuffix = true,
+    this.collisionStyle = '_1',
     this.prefix = '',
     this.suffix = '',
     this.forceOcr = false,
@@ -101,7 +103,7 @@ class Settings {
         'timeOn': timeOn,
         'secondsRule': secondsRule,
         'timestampSource': timestampSource,
-        'collisionSuffix': collisionSuffix,
+        'collisionSuffix': collisionStyle,
         'prefix': prefix,
         'suffix': suffix,
         'forceOcr': forceOcr,
@@ -118,7 +120,9 @@ class Settings {
         timeOn: j['timeOn'] as bool? ?? true,
         secondsRule: j['secondsRule'] as String? ?? 'auto',
         timestampSource: j['timestampSource'] as String? ?? 'earliest',
-        collisionSuffix: j['collisionSuffix'] as bool? ?? true,
+        collisionStyle: j['collisionSuffix'] is String
+            ? (j['collisionSuffix'] as String)
+            : (j['collisionSuffix'] as bool? ?? true ? '_1' : ''),
         prefix: j['prefix'] as String? ?? '',
         suffix: j['suffix'] as String? ?? '',
         forceOcr: j['forceOcr'] as bool? ?? false,
@@ -232,7 +236,7 @@ Future<Settings?> _migrateEguiSettings() async {
     // Flutter only supports on/off with "_1": any non-empty egui
     // suffix ("_1", "-1", "(1)") maps to on; empty maps to off.
     final coll = kv['photo_collision_suffix'];
-    s.collisionSuffix = coll != null && coll.isNotEmpty;
+    s.collisionStyle = coll != null && ['_1', '-1', '(1)'].contains(coll) ? coll : '_1';
     s.prefix = kv['photo_prefix'] ?? '';
     s.suffix = kv['photo_suffix_text'] ?? '';
     return s;
@@ -371,7 +375,7 @@ class FileNamerApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'File Namer AI (Flutter Trial)',
+      title: 'File Namer AI',
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.teal),
         useMaterial3: true,
@@ -424,6 +428,7 @@ class _HomePageState extends State<HomePage> {
       });
     });
     if (Platform.isWindows) _checkMenu();
+    _checkUpdates();
   }
 
   Future<void> _save() => saveSettings(settings);
@@ -609,7 +614,7 @@ class _HomePageState extends State<HomePage> {
         };
       }).toList();
       final resolved = RustBridge.resolveBatch(jsonEncode({
-        'photo_collision_suffix': settings.collisionSuffix ? '_1' : '',
+        'photo_collision_suffix': settings.collisionStyle,
         'rows': rows,
       }));
       final results = (resolved['results'] as List?) ?? [];
@@ -720,7 +725,7 @@ class _HomePageState extends State<HomePage> {
       } else {
         final body = jsonDecode(resp.body) as Map<String, dynamic>;
         final tag = ((body['tag_name'] as String?) ?? '').replaceAll(RegExp(r'^v'), '');
-        const current = '1.4.0';
+        final current = appVersion;
         if (tag.isEmpty) {
           setState(() => updateStatus = 'Could not check for updates (no releases found).');
         } else if (tag == current) {
@@ -779,7 +784,7 @@ class _HomePageState extends State<HomePage> {
       length: 2,
       child: Scaffold(
         appBar: AppBar(
-          title: const Text('File Namer AI — Flutter Trial'),
+          title: const Text('File Namer AI'),
           bottom: const TabBar(tabs: [
             Tab(text: 'Rename'),
             Tab(text: 'Settings'),
@@ -1066,7 +1071,7 @@ class _HomePageState extends State<HomePage> {
           _save();
         },
       ),
-      SwitchListTile(
+      CheckboxListTile(
         title: const Text('Force AI OCR for PDFs'),
         subtitle: const Text(
             'Use Ollama vision OCR even when a PDF already has a text layer. Off = OCR only for image-only PDFs.'),
@@ -1076,7 +1081,7 @@ class _HomePageState extends State<HomePage> {
           _save();
         },
       ),
-      SwitchListTile(
+      CheckboxListTile(
         title: const Text('Append date to document names'),
         subtitle: const Text(
             'Documents get _DD-Mon-YYYY, checked against the document itself.'),
@@ -1086,7 +1091,7 @@ class _HomePageState extends State<HomePage> {
           _save();
         },
       ),
-      SwitchListTile(
+      CheckboxListTile(
         title: const Text('Never add dates to document names'),
         subtitle: const Text(
             'Overrides "Append date" above: document names keep their stem, no date added.'),
@@ -1209,7 +1214,7 @@ class _HomePageState extends State<HomePage> {
               _save();
             },
           ),
-          SwitchListTile(
+          CheckboxListTile(
             title: const Text('Include time'),
             value: settings.timeOn,
             onChanged: (v) {
@@ -1249,11 +1254,17 @@ class _HomePageState extends State<HomePage> {
               _save();
             },
           ),
-          SwitchListTile(
-            title: const Text('Collision suffix (_1, _2)'),
-            value: settings.collisionSuffix,
+          DropdownButtonFormField<String>(
+            value: settings.collisionStyle,
+            decoration: const InputDecoration(labelText: 'Collision suffix style'),
+            items: const [
+              DropdownMenuItem(value: '_1', child: Text('_1')),
+              DropdownMenuItem(value: '-1', child: Text('-1')),
+              DropdownMenuItem(value: '(1)', child: Text('(1)')),
+              DropdownMenuItem(value: '', child: Text('None')),
+            ],
             onChanged: (v) {
-              setState(() => settings.collisionSuffix = v);
+              if (v != null) setState(() => settings.collisionStyle = v);
               _save();
             },
           ),
