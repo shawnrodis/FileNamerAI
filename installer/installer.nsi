@@ -34,6 +34,10 @@ ShowInstDetails show
 Section "File Namer AI" SecApp
   SectionIn RO  ; required — cannot be unchecked
   SetOutPath "$INSTDIR"
+  ; Update-in-place over the old egui version: remove its exe first,
+  ; so an update does not leave two app exes behind (same pattern as
+  ; Tuya, which deletes SmartLifeTuyaDesktop.exe on install).
+  Delete "$INSTDIR\FileNamerAI.exe"
   ; All files from the Flutter Windows Release folder, including data/.
   File /r "staging\*.*"
   WriteUninstaller "$INSTDIR\Uninstall.exe"
@@ -72,6 +76,9 @@ SectionEnd
 !insertmacro MUI_FUNCTION_DESCRIPTION_END
 
 Section "Uninstall"
+  ; Also clean up the old egui exe, for users who installed the
+  ; Flutter version before the install-section delete above existed.
+  Delete "$INSTDIR\FileNamerAI.exe"
   Delete "$INSTDIR\filenamer_ai_flutter.exe"
   Delete "$INSTDIR\filenamer_core.dll"
   Delete "$INSTDIR\flutter_windows.dll"

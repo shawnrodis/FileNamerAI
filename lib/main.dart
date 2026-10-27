@@ -23,9 +23,11 @@
 //    titles are never invented.
 //  - Already-correctly-named files are left alone.
 //
-// KNOWN GAPS (honest, not faked): AI OCR for image-only PDFs via
-// Ollama vision; Mac DMG; automatic update installer (update check is
-// implemented, it only reports availability). Windows right-click menu
+// KNOWN GAPS (honest, not faked): Mac DMG; automatic update
+// installer (update check is implemented, it only reports
+// availability). AI OCR for image-only PDFs works via the Rust core
+// (Ollama vision model), with a Force AI OCR toggle in Settings.
+// Windows right-click menu
 // install/remove is implemented via per-user HKCU reg commands. File "Created" time is NOT exposed by Dart's FileStat
 // on all platforms, so the earliest-timestamp rule uses EXIF DateTimeOriginal
 // + file Modified here; on Windows that is usually the closest available
@@ -61,6 +63,17 @@ class Settings {
   bool collisionSuffix;
   String prefix;
   String suffix;
+  // Document-naming options from the egui app (Rust core reads all
+  // three via parse_config_dart: forceOcr, appendDate, neverDates).
+  // forceOcr: use Ollama vision OCR even when a PDF has a text layer.
+  // appendDate: append _DD-Mon-YYYY to document names (default true).
+  // neverDates: never add dates to document names (overrides appendDate
+  // in Rust: append_date && !never_dates, and a never-dated name keeps
+  // its stem). These were previously lost on update because Flutter
+  // Settings did not expose them, even though Rust supported them.
+  bool forceOcr;
+  bool appendDate;
+  bool neverDates;
 
   Settings({
     this.ollamaUrl = 'http://localhost:11434',
@@ -74,6 +87,9 @@ class Settings {
     this.collisionSuffix = true,
     this.prefix = '',
     this.suffix = '',
+    this.forceOcr = false,
+    this.appendDate = true,
+    this.neverDates = false,
   });
 
   Map<String, dynamic> toJson() => {
@@ -88,6 +104,9 @@ class Settings {
         'collisionSuffix': collisionSuffix,
         'prefix': prefix,
         'suffix': suffix,
+        'forceOcr': forceOcr,
+        'appendDate': appendDate,
+        'neverDates': neverDates,
       };
 
   static Settings fromJson(Map<String, dynamic> j) => Settings(
@@ -102,6 +121,9 @@ class Settings {
         collisionSuffix: j['collisionSuffix'] as bool? ?? true,
         prefix: j['prefix'] as String? ?? '',
         suffix: j['suffix'] as String? ?? '',
+        forceOcr: j['forceOcr'] as bool? ?? false,
+        appendDate: j['appendDate'] as bool? ?? true,
+        neverDates: j['neverDates'] as bool? ?? false,
       );
 }
 
@@ -111,11 +133,126 @@ Future<File> _settingsFile() async {
   return File(p.join(dir.path, 'filenamer_ai_flutter_settings.json'));
 }
 
+// One-time migration from the old egui settings file
+// (FileNamerAI.ini, plain key=value lines, egui load_config).
+// Runs ONLY if the new settings file does not already exist, and the
+// migrated settings are saved immediately, so migration runs exactly
+// once and never overwrites a user's new settings. A missing or
+// corrupt old file is silently ignored (defaults, no crash).
+// Old locations (egui config_path): Windows = directory of the exe +
+// "FileNamerAI.ini"; macOS = ~/Library/Application Support/
+// FileNamerAI/FileNamerAI.ini. Both candidates are tried, in that
+// order, so a Windows install moved to Mac (or vice versa) still
+// migrates if the old file is present.
+// Known limitation: egui collision suffixes "-1" and "(1)" collapse
+// to "_1" in Flutter, which only supports on/off with "_1".
+Future<Settings?> _migrateEguiSettings() async {
+  try {
+    final candidates = <File>[];
+    try {
+      candidates.add(File(p.join(
+          p.dirname(Platform.resolvedExecutable), 'FileNamerAI.ini')));
+    } catch (_) {}
+    try {
+      final home = Platform.environment['HOME'] ??
+          Platform.environment['USERPROFILE'] ??
+          '';
+      if (home.isNotEmpty) {
+        candidates.add(File(p.join(home, 'Library', 'Application Support',
+            'FileNamerAI', 'FileNamerAI.ini')));
+      }
+    } catch (_) {}
+    File? old;
+    for (final c in candidates) {
+      try {
+        if (await c.exists()) {
+          old = c;
+          break;
+        }
+      } catch (_) {}
+    }
+    if (old == null) return null;
+    final kv = <String, String>{};
+    for (final line in await old.readAsLines()) {
+      final eq = line.indexOf('=');
+      if (eq < 0) continue;
+      kv[line.substring(0, eq).trim()] = line.substring(eq + 1).trim();
+    }
+    if (kv.isEmpty) return null;
+    String nonEmpty(String key, String fallback) {
+      final v = kv[key];
+      return (v == null || v.isEmpty) ? fallback : v;
+    }
+
+    final s = Settings();
+    s.ollamaUrl = nonEmpty('ollama_url', 'http://localhost:11434');
+    s.model = nonEmpty('model', 'qwen2.5:3b');
+    s.visionModel = nonEmpty('vision_model', 'moondream');
+    s.appendDate = kv['append_date'] != 'false';
+    s.neverDates = kv['never_dates'] == 'true';
+    s.forceOcr = kv['force_ocr'] == 'true';
+    // egui internal values, validated exactly as egui did
+    // (PhotoSettings::validated + load_config defaults).
+    switch (kv['photo_date_order']) {
+      case 'dd-mm-yy':
+        s.dateOrder = 'DD-MM-YY';
+        break;
+      case 'yyyy-mm-dd':
+        s.dateOrder = 'YY-MM-DD';
+        break;
+      case 'mm-dd-yy':
+      default:
+        s.dateOrder = 'MM-DD-YY';
+    }
+    final sep = kv['photo_separator'];
+    s.separator = (sep == '-' || sep == '_') ? sep! : '-';
+    s.timeOn = kv['photo_include_time'] != 'false';
+    switch (kv['photo_seconds']) {
+      case 'never':
+        s.secondsRule = 'keep';
+        break;
+      case 'always':
+        s.secondsRule = 'truncate';
+        break;
+      case 'current':
+      default:
+        s.secondsRule = 'auto';
+    }
+    switch (kv['photo_source']) {
+      case 'latest':
+        s.timestampSource = 'latest';
+        break;
+      case 'exif_only':
+        s.timestampSource = 'exif-only';
+        break;
+      case 'earliest':
+      default:
+        s.timestampSource = 'earliest';
+    }
+    // Flutter only supports on/off with "_1": any non-empty egui
+    // suffix ("_1", "-1", "(1)") maps to on; empty maps to off.
+    final coll = kv['photo_collision_suffix'];
+    s.collisionSuffix = coll != null && coll.isNotEmpty;
+    s.prefix = kv['photo_prefix'] ?? '';
+    s.suffix = kv['photo_suffix_text'] ?? '';
+    return s;
+  } catch (_) {
+    return null;
+  }
+}
+
 Future<Settings> loadSettings() async {
   try {
     final f = await _settingsFile();
     if (await f.exists()) {
       return Settings.fromJson(jsonDecode(await f.readAsString()));
+    }
+    // First launch only: import egui settings, then save them as the
+    // new settings file so this never runs again.
+    final migrated = await _migrateEguiSettings();
+    if (migrated != null) {
+      await saveSettings(migrated);
+      return migrated;
     }
   } catch (_) {}
   return Settings();
@@ -926,6 +1063,36 @@ class _HomePageState extends State<HomePage> {
         decoration: const InputDecoration(labelText: 'Vision model (PDF OCR)'),
         onChanged: (v) {
           settings.visionModel = v;
+          _save();
+        },
+      ),
+      SwitchListTile(
+        title: const Text('Force AI OCR for PDFs'),
+        subtitle: const Text(
+            'Use Ollama vision OCR even when a PDF already has a text layer. Off = OCR only for image-only PDFs.'),
+        value: settings.forceOcr,
+        onChanged: (v) {
+          setState(() => settings.forceOcr = v);
+          _save();
+        },
+      ),
+      SwitchListTile(
+        title: const Text('Append date to document names'),
+        subtitle: const Text(
+            'Documents get _DD-Mon-YYYY, checked against the document itself.'),
+        value: settings.appendDate,
+        onChanged: (v) {
+          setState(() => settings.appendDate = v);
+          _save();
+        },
+      ),
+      SwitchListTile(
+        title: const Text('Never add dates to document names'),
+        subtitle: const Text(
+            'Overrides "Append date" above: document names keep their stem, no date added.'),
+        value: settings.neverDates,
+        onChanged: (v) {
+          setState(() => settings.neverDates = v);
           _save();
         },
       ),

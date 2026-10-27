@@ -1477,8 +1477,8 @@ fn parse_config_dart(json: &str) -> Config {
         ollama_url: get_s("ollamaUrl", DEFAULT_OLLAMA_URL),
         model: get_s("model", DEFAULT_MODEL),
         vision_model: get_s("visionModel", DEFAULT_VISION_MODEL),
-        append_date: true,
-        never_dates: false,
+        append_date: get_b("appendDate", true),
+        never_dates: get_b("neverDates", false),
         force_ocr: v.get("forceOcr").and_then(|x| x.as_bool()).unwrap_or(false),
         photo: PhotoSettings {
             date_order: date_order.into(),
