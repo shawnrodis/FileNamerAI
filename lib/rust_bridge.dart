@@ -47,6 +47,8 @@ typedef _FnaNoArgNative = ffi.Pointer<Utf8> Function();
 typedef _FnaNoArgDart = ffi.Pointer<Utf8> Function();
 typedef _FnaFreeNative = ffi.Void Function(ffi.Pointer<Utf8>);
 typedef _FnaFreeDart = void Function(ffi.Pointer<Utf8>);
+typedef _FnaVoidNative = ffi.Void Function();
+typedef _FnaVoidDart = void Function();
 typedef _FnaMenuNative = ffi.Int32 Function();
 typedef _FnaMenuDart = int Function();
 
@@ -131,6 +133,17 @@ class RustBridge {
       throw StateError((result['error'] as String?) ?? 'Download failed');
     }
     return result['path'] as String;
+  }
+
+  static void ensureMultiselect() {
+    try {
+      final lib = _open();
+      final fn = lib.lookupFunction<_FnaVoidNative, _FnaVoidDart>(
+          'fna_ensure_multiselect');
+      fn();
+    } catch (_) {
+      // Best effort only: a missing core must not block app launch.
+    }
   }
 
   static bool menuInstalled() {

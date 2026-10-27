@@ -1685,7 +1685,7 @@ pub extern "C" fn fna_free_string(ptr: *mut c_char) {
 
 #[no_mangle]
 pub extern "C" fn fna_version() -> *mut c_char {
-    string_to_ptr("1.4.1-rust".to_string())
+    string_to_ptr("1.4.2-rust".to_string())
 }
 
 #[no_mangle]
@@ -1735,6 +1735,11 @@ pub extern "C" fn fna_download_ollama_installer() -> *mut c_char {
         Ok(p) => json_ptr(serde_json::json!({"path": p.to_string_lossy()})),
         Err(e) => json_ptr(serde_json::json!({"error": e})),
     }
+}
+
+#[no_mangle]
+pub extern "C" fn fna_ensure_multiselect() {
+    ensure_multiselect();
 }
 
 #[no_mangle]

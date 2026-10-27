@@ -51,7 +51,7 @@ import 'rust_bridge.dart';
 
 // ---------------------------------------------------------------- settings
 
-const String appVersion = '1.4.1';
+const String appVersion = '1.4.2';
 
 class Settings {
   String ollamaUrl;
@@ -365,16 +365,111 @@ String stripTrailingSuffix(String stem) {
 
 // ---------------------------------------------------------------------- UI
 
-void main(List<String> args) {
+// egui coordinate_files(), ported to Dart: when Windows invokes the
+// app once per selected file (despite MultiSelectModel Player), the
+// first process becomes coordinator, waits 900ms collecting drop files
+// from the stragglers, and opens ONE window with all of them.
+// A straggler writes its file path to %TEMP%\\FileNamerAI-batch and
+// exits quietly, before any window is created.
+Future<List<String>> _coordinateFiles(List<String> files) async {
+  if (!Platform.isWindows || files.length != 1) return files;
+  final dir = Directory(p.join(Directory.systemTemp.path, 'FileNamerAI-batch'));
+  try {
+    dir.createSync(recursive: true);
+  } catch (_) {
+    return files;
+  }
+  final lock = File(p.join(dir.path, 'coordinator.lock'));
+  bool fresh(File f) {
+    try {
+      return DateTime.now().difference(f.statSync().modified) <
+          const Duration(seconds: 10);
+    } catch (_) {
+      return false;
+    }
+  }
+  bool isCoordinator = false;
+  try {
+    lock.createSync(exclusive: true);
+    isCoordinator = true;
+  } catch (_) {
+    if (fresh(lock)) {
+      try {
+        final tag = p.basename(files[0]).split('').map((c) {
+          return RegExp(r'[A-Za-z0-9]').hasMatch(c) ? c : '_';
+        }).join();
+        File(p.join(dir.path, '${pid}_$tag.txt'))
+            .writeAsStringSync(files[0]);
+      } catch (_) {}
+      exit(0);
+    }
+    try {
+      lock.deleteSync();
+      lock.createSync(exclusive: true);
+      isCoordinator = true;
+    } catch (_) {
+      return files;
+    }
+  }
+  if (!isCoordinator) return files;
+  try {
+    for (final e in dir.listSync()) {
+      if (e.path != lock.path &&
+          e.path.endsWith('.txt') &&
+          !fresh(File(e.path))) {
+        try {
+          e.deleteSync();
+        } catch (_) {}
+      }
+    }
+  } catch (_) {}
+  final all = List<String>.from(files);
+  final sw = Stopwatch()..start();
+  while (sw.elapsed < const Duration(milliseconds: 900)) {
+    try {
+      for (final e in dir.listSync()) {
+        if (e.path == lock.path || !e.path.endsWith('.txt')) continue;
+        final f = File(e.path);
+        if (!fresh(f)) continue;
+        try {
+          final content = f.readAsStringSync().trim();
+          if (content.isNotEmpty &&
+              File(content).existsSync() &&
+              !all.contains(content)) {
+            all.add(content);
+          }
+        } catch (_) {}
+        try {
+          f.deleteSync();
+        } catch (_) {}
+      }
+    } catch (_) {}
+    await Future.delayed(const Duration(milliseconds: 60));
+  }
+  try {
+    lock.deleteSync();
+  } catch (_) {}
+  return all;
+}
+
+Future<void> main(List<String> args) async {
   // Right-click (and any shell launch) passes file paths as arguments.
   // Flutter desktop delivers them via main's args; fall back to
   // Platform.executableArguments as well, in case the engine route
-  // differs. Flags are dropped, files are filtered in _addPaths.
+  // differs. Flags are dropped, files are filtered here and in _addPaths.
   final initial = <String>{};
   for (final a in [...args, ...Platform.executableArguments]) {
     if (!a.startsWith('-')) initial.add(a);
   }
-  runApp(FileNamerApp(initialPaths: initial.toList()));
+  var files =
+      initial.where((f) => File(f).existsSync()).toList();
+  if (Platform.isWindows) {
+    // egui main() did this on every launch: repair a wrong-model verb
+    // (v1.3.0 set the wrong model) so the NEXT multi-select is Player.
+    RustBridge.ensureMultiselect();
+    files = await _coordinateFiles(files);
+  }
+  runApp(FileNamerApp(initialPaths: files));
 }
 
 class FileNamerApp extends StatelessWidget {
