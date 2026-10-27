@@ -1,6 +1,6 @@
 [package]
 name = "filenamer_core"
-version = "1.4.3"
+version = "1.4.4"
 edition = "2021"
 license = "GPL-3.0-only"
 

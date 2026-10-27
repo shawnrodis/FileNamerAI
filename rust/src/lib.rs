@@ -1685,7 +1685,7 @@ pub extern "C" fn fna_free_string(ptr: *mut c_char) {
 
 #[no_mangle]
 pub extern "C" fn fna_version() -> *mut c_char {
-    string_to_ptr("1.4.3-rust".to_string())
+    string_to_ptr("1.4.4-rust".to_string())
 }
 
 #[no_mangle]

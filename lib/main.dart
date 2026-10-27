@@ -51,7 +51,7 @@ import 'rust_bridge.dart';
 
 // ---------------------------------------------------------------- settings
 
-const String appVersion = '1.4.3';
+const String appVersion = '1.4.4';
 
 class Settings {
   String ollamaUrl;
