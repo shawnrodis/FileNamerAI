@@ -18,6 +18,16 @@ previous all-Rust egui version is preserved on the `egui-legacy`
 branch. Distributed as an installer, no console window. Runs as a
 normal user (no administrator rights needed).
 
+<p align="center">
+  <img src="assets/screenshot-rename.png" alt="The File Namer AI Rename tab: drop files here to rename them" width="520">
+  <br><em>The Rename tab — drop files in, propose names, rename.</em>
+</p>
+
+<p align="center">
+  <img src="assets/screenshot-settings.png" alt="The File Namer AI Settings tab: local AI (Ollama) connection, models, and right-click menu options" width="520">
+  <br><em>Settings — local AI (Ollama), models, and the right-click menu.</em>
+</p>
+
 ## Download
 
 Grab the latest release from
