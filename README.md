@@ -7,7 +7,7 @@
 Right-click any file, or drag files onto the app, to rename them locally:
 photos and videos get automatic, customizable date-based names, documents —
 including Word, Excel, and PowerPoint files — get smart names from their
-contents, in batches too. For Windows — the Mac update is coming next.
+contents, in batches too. Available for Windows and Mac.
 No cloud, no uploads.
 
 Built with a Rust core and a [Flutter](https://flutter.dev/) UI, in the
@@ -26,6 +26,7 @@ normal user (no administrator rights needed).
 <p align="center">
   <img src="assets/screenshot-settings.png" alt="The File Namer AI Settings tab: local AI (Ollama) connection, models, and right-click menu options" width="520">
   <br><em>Settings — local AI (Ollama), models, and the right-click menu.</em>
+  <br><em>Note: the "Gaps" footer visible in this screenshot is from an older version — a Mac build has shipped since v1.4.5.</em>
 </p>
 
 ## Download
@@ -37,10 +38,7 @@ Grab the latest release from
   install, no admin rights needed. It places the app in
   `%LOCALAPPDATA%\FileNamerAI`, registers the right-click menu, and adds
   an uninstaller.
-- **Mac:** not built yet for the Flutter version — the Mac build is still
-  pending (the old egui Mac DMG workflow was removed with the migration;
-  see Gaps below). The `egui-legacy` branch still has the old Mac build
-  instructions.
+- **Mac:** `FileNamerAI-vX.Y.Z.dmg` — available since v1.4.5.
 
 ## How it works
 
@@ -99,7 +97,6 @@ or use the setup exe, then run the app inside it.
 - AI OCR for image-only PDFs via Ollama vision — not wired up yet
   (the vision model field exists in Settings, but image-only PDFs fall
   back to date-based names for now).
-- Mac build — pending for the Flutter version.
 - Automatic update installer — Check for updates only reports
   availability for now; download the new release from the releases page.
 - File Created time is not available in Dart on all platforms, so the
