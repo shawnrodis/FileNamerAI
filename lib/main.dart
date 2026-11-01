@@ -48,10 +48,17 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
 import 'rust_bridge.dart';
+import 'updater.dart';
 
 // ---------------------------------------------------------------- settings
 
-const String appVersion = '1.4.5';
+// KEEP IN SYNC WITH pubspec.yaml's version. This constant is the
+// version the updater compares against, and it is NOT derived from
+// pubspec at build time — v1.4.6 shipped with this still at 1.4.5,
+// so every install was offered its own version as an "update"
+// forever. The release checklist has five version locations;
+// this is one of them.
+const String appVersion = '1.4.6';
 
 class Settings {
   String ollamaUrl;
@@ -873,30 +880,27 @@ class _HomePageState extends State<HomePage> {
         final current = appVersion;
         if (tag.isEmpty) {
           setState(() => updateStatus = 'Could not check for updates (no releases found).');
-        } else if (tag == current) {
+        } else if (!updateVersionNewer(tag, current)) {
           setState(() => updateStatus = 'Up to date (v$current).');
         } else {
           // Exact asset name, per platform — never a zip or a stray file.
           // Windows: the NSIS installer. macOS: the DMG.
-          final expected = Platform.isMacOS
-              ? 'FileNamerAI-v$tag.dmg'
-              : 'FileNamerAI-Setup-v$tag.exe';
-          Map<String, dynamic>? asset;
-          for (final a in (body['assets'] as List?) ?? []) {
-            if (a is Map<String, dynamic> && a['name'] == expected) {
-              asset = a;
-              break;
-            }
-          }
-          if (asset == null) {
+          final expected = expectedUpdateAssetName(tag, Platform.isMacOS);
+          final asset =
+              selectUpdateAsset((body['assets'] as List?) ?? [], expected);
+          // Extract before setState: a captured nullable local is
+          // not promoted inside the setState closure. An asset with
+          // an empty URL must count as not found: otherwise the
+          // Download button would show, and pressing it would hit
+          // the empty-URL early return in silence.
+          final assetUrl = asset == null
+              ? ''
+              : (asset['browser_download_url'] as String?) ?? '';
+          final assetSize = asset == null ? 0 : (asset['size'] as int?) ?? 0;
+          if (asset == null || assetUrl.isEmpty) {
             setState(() => updateStatus =
                 'Update available: $tag (you have v$current) — update file not found on the releases page.');
           } else {
-            // Extract before setState: a captured nullable local is
-            // not promoted inside the setState closure.
-            final assetUrl =
-                (asset['browser_download_url'] as String?) ?? '';
-            final assetSize = (asset['size'] as int?) ?? 0;
             setState(() {
               updateTag = tag;
               updateAssetUrl = assetUrl;
@@ -946,7 +950,7 @@ class _HomePageState extends State<HomePage> {
       await dest.writeAsBytes(chunks);
       if (isMac) {
         await _installMacUpdate(dest);
-        return; // _installMacUpdate exits the app after launching the script.
+        return; // macOS: the .dmg is opened above; the app keeps running.
       }
       setState(() =>
           updateStatus = 'Downloaded ${updateAssetName} — launching installer…');
@@ -970,36 +974,22 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  // macOS install: same pattern as the Windows .bat, as a shell script.
-  // The script waits for this process to exit, mounts the DMG, replaces
-  // the .app bundle in place (wherever it actually lives, derived from
-  // the running executable — /Applications or anywhere else), opens
-  // the new app, then deletes the DMG and itself. Attach happens
-  // before any removal, so a failed mount leaves the old app intact.
+  // macOS install, mirroring Homestead: open the downloaded .dmg and
+  // let the user drag the app into Applications. The app keeps
+  // running; it never touches its own bundle and does not exit.
+  // (The previous self-replace shell script is gone: its dollar-
+  // variable references were backslash-escaped in Dart strings, so
+  // bash received literal dollar text, hdiutil attach failed, and
+  // the script exited before rm/cp/open ever ran -- the app quit
+  // and the user was left on the old version with no error.)
   Future<void> _installMacUpdate(File dmg) async {
-    final exe = Platform.resolvedExecutable;
-    final appBundle = p.dirname(p.dirname(p.dirname(exe)));
-    final script =
-        File(p.join(Directory.systemTemp.path, 'FileNamerAI-update.sh'));
-    final lines = <String>[
-      '#!/bin/bash',
-      'APP_PID="$pid"',
-      'DMG="${dmg.path}"',
-      'APP="$appBundle"',
-      'for i in \$(seq 1 30); do kill -0 "\$APP_PID" 2>/dev/null || break; sleep 1; done',
-      'MNT="\$(mktemp -d /tmp/FileNamerAI-update-mnt.XXXXXX)"',
-      'hdiutil attach "\$DMG" -nobrowse -mountpoint "\$MNT" >/dev/null 2>&1 || exit 1',
-      'rm -rf "\$APP"',
-      'cp -R "\$MNT/FileNamerAI.app" "\$APP"',
-      'hdiutil detach "\$MNT" >/dev/null 2>&1',
-      'open "\$APP"',
-      'rm -f "\$DMG" "\$0"',
-    ];
-    await script.writeAsString(lines.join('\n'));
-    setState(() =>
-        updateStatus = 'Downloaded ${dmg.path.split('/').last} — installing update…');
-    await Process.start('bash', [script.path]);
-    exit(0);
+    final cmd = macOpenCommand(dmg.path);
+    setState(() {
+      updateDownloading = false;
+      updateStatus =
+          'Downloaded ${dmg.path.split('/').last} — disk image opened; drag FileNamerAI into Applications to update.';
+    });
+    await Process.start(cmd[0], cmd.sublist(1));
   }
 
   Future<void> _checkMenu() async {
