@@ -826,7 +826,7 @@ fn build_prompt(original: &str, content: &str, append_date: bool, attempt: u32) 
          \n\
          Rules (follow exactly):\n\
          - Output ONLY the filename: no quotes, no explanation, no file extension.\n\
-         - Use spaces between words with normal Title Case (e.g. Example Document Title). Never ALL CAPS.\n\
+         - Use spaces between words with normal Title Case (e.g. Example Document Title). Never ALL CAPS, never dashes or underscores between words (e.g. Important Safety Recall, not important-safety-recall).\n\
          - The title must use ONLY words that appear in the document content below. Never invent a title or borrow words from these instructions.\n\
          - NEVER use a field label as the title: not Today's Date, From, To, Subject, Date, an address, a phone number, or any other metadata label. Those describe the document; they are not its subject.\n\
          - Ignore email headers (From/To/Date lines), page headers/footers, and boilerplate — name the document by its actual content, not its envelope.\n\
@@ -1054,11 +1054,12 @@ fn ask_ollama(cfg: &Config, path: &Path, content: &str, attempt: u32) -> Result<
         Some((stem, d, m, y)) => (stem.to_string(), Some((d, m, y))),
         None => (name.clone(), None),
     };
-    let stem: String = de_shout(&raw_stem)
-        .replace('_', " ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    // Normalize the descriptive stem to Title Case words separated by
+    // spaces. The model sometimes returns a lowercase dash slug (e.g.
+    // "important-safety-recall") despite the prompt asking for Title
+    // Case, so the formatting is enforced here too. The date suffix was
+    // already split off above, so it is untouched by this step.
+    let stem: String = title_case_slug(&de_shout(&raw_stem));
     // Verify the title itself, not just the date: the model must not
     // invent a title (or parrot the prompt's example). If the title's
     // words aren't in the document, reject so the user can re-roll.
@@ -1302,6 +1303,26 @@ fn de_shout(s: &str) -> String {
         }
     }
     out
+}
+
+/// "important-safety-recall" / "important_safety_recall" / "important safety
+/// recall" -> "Important Safety Recall". Splits on dashes, underscores, and
+/// whitespace; capitalizes the first letter of EVERY word (no small-word
+/// exceptions — and/of/the are capitalized like any other word); leaves
+/// the rest of each word untouched; joins with single spaces. Applied to
+/// the descriptive stem only — never to a date suffix or an extension.
+fn title_case_slug(s: &str) -> String {
+    s.split(|c: char| c == '-' || c == '_' || c.is_whitespace())
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let mut chars = w.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Trailing incomplete date: _YYYY or _Mon-YYYY. Returns the stem without it.
@@ -1760,5 +1781,84 @@ pub extern "C" fn fna_uninstall_menu() -> *mut c_char {
     match uninstall_menu() {
         Ok(()) => json_ptr(serde_json::json!({"ok": true})),
         Err(e) => json_ptr(serde_json::json!({"ok": false, "error": e})),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dash_slug_becomes_title_case_spaces() {
+        assert_eq!(
+            title_case_slug("important-safety-recall"),
+            "Important Safety Recall"
+        );
+    }
+
+    #[test]
+    fn underscore_and_space_slugs_become_title_case_spaces() {
+        assert_eq!(
+            title_case_slug("important_safety_recall"),
+            "Important Safety Recall"
+        );
+        assert_eq!(
+            title_case_slug("important safety recall"),
+            "Important Safety Recall"
+        );
+        assert_eq!(
+            title_case_slug("important  safety   recall"),
+            "Important Safety Recall"
+        );
+    }
+
+    #[test]
+    fn already_title_case_passes_through_unchanged() {
+        assert_eq!(
+            title_case_slug("Important Safety Recall"),
+            "Important Safety Recall"
+        );
+        assert_eq!(
+            title_case_slug("Example Document Title"),
+            "Example Document Title"
+        );
+    }
+
+    #[test]
+    fn every_word_capitalized_including_small_words() {
+        assert_eq!(
+            title_case_slug("terms-and-conditions-of-use"),
+            "Terms And Conditions Of Use"
+        );
+    }
+
+    #[test]
+    fn all_caps_slug_de_shouts_then_title_cases() {
+        // de_shout runs first in ask_ollama; the composition must match.
+        assert_eq!(
+            title_case_slug(&de_shout("IMPORTANT-SAFETY-RECALL")),
+            "Important Safety Recall"
+        );
+    }
+
+    #[test]
+    fn date_suffix_split_off_untouched_by_stem_normalization() {
+        // The user's exact case: stem normalizes, date suffix is preserved
+        // byte-identical through split + re-format.
+        let name = "important-safety-recall_01-Nov-2026";
+        let (stem, d, m, y) = split_date_suffix(name).expect("date suffix");
+        assert_eq!(stem, "important-safety-recall");
+        assert_eq!(title_case_slug(stem), "Important Safety Recall");
+        assert_eq!(fmt_doc_date(d, m, y), "01-Nov-2026");
+        assert_eq!(
+            format!("{}_{}", title_case_slug(stem), fmt_doc_date(d, m, y)),
+            "Important Safety Recall_01-Nov-2026"
+        );
+    }
+
+    #[test]
+    fn numbers_and_apostrophes_survive_normalization() {
+        assert_eq!(title_case_slug("form-1040"), "Form 1040");
+        assert_eq!(title_case_slug("mother's-day-card"), "Mother's Day Card");
     }
 }
