@@ -4,6 +4,23 @@
 # and the Tuya Mac builds: personal projects, no paid Apple
 # membership. Gatekeeper "Open Anyway" instructions stay in README.
 #
+# Runner note (2026-11-12): runs-on is macos-15-intel, NOT
+# macos-latest. macos-latest resolves to the Apple Silicon (arm64)
+# hosted pool, which has been capacity-constrained since 2026-10-27:
+# File Namer jobs 43273214141 and 43276805609 both queued ~15
+# minutes, never got a runner (runner_id 0, no steps), and were
+# cancelled with GitHub's own annotation "The job was not acquired
+# by Runner of type hosted even after multiple attempts" — the same
+# failure Tuya hit seven times in late October. The Intel pool is
+# separate, and Tuya's release-mac.yml has built on macos-15-intel
+# successfully ever since (e.g. 2026-11-05, run 41937421298).
+# Difference from the arm64 builds: the Flutter app binary itself
+# is x86_64 when built on Intel (the Rust dylib is still universal
+# via lipo), so on Apple Silicon Macs the app runs via Rosetta 2.
+# Revisit if arm64 capacity recovers, and before macos-15-intel
+# retires (GitHub ends Intel macOS support when the macos-15 image
+# retires, Fall 2027).
+#
 # Trigger: manual dispatch only, so a Windows push does not also
 # rebuild the Mac app. Dispatch with the release tag that should
 # receive the DMG (e.g. v1.4.3 — the release already exists; this
@@ -32,7 +49,7 @@ permissions:
 
 jobs:
   build-macos:
-    runs-on: macos-latest
+    runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
