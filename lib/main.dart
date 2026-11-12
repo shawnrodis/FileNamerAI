@@ -69,7 +69,7 @@ class Settings {
   bool timeOn;
   String secondsRule; // 'auto', 'keep', 'truncate'
   String timestampSource; // 'earliest', 'latest', 'exif-only'
-  String collisionStyle; // '_1', '-1', '(1)', or '' (none)
+  String collisionStyle; // '_1', '-1', or '(1)' — no "none" option
   String prefix;
   String suffix;
   // Document-naming options from the egui app (Rust core reads all
@@ -118,6 +118,16 @@ class Settings {
         'neverDates': neverDates,
       };
 
+  // Collision suffix styles, after 2026-11-12: "None" is gone. It let
+  // two files share a final name and lose one to an overwrite, so any
+  // stored value that isn't a real style (including "None" from an
+  // older settings file, or the old true/false form) falls back to
+  // the default _1 on load.
+  static String _validCollisionStyle(dynamic v) {
+    if (v is String && ['_1', '-1', '(1)'].contains(v)) return v;
+    return '_1';
+  }
+
   static Settings fromJson(Map<String, dynamic> j) => Settings(
         ollamaUrl: j['ollamaUrl'] as String? ?? 'http://localhost:11434',
         model: j['model'] as String? ?? 'qwen2.5:3b',
@@ -127,9 +137,7 @@ class Settings {
         timeOn: j['timeOn'] as bool? ?? true,
         secondsRule: j['secondsRule'] as String? ?? 'auto',
         timestampSource: j['timestampSource'] as String? ?? 'earliest',
-        collisionStyle: j['collisionSuffix'] is String
-            ? (j['collisionSuffix'] as String)
-            : (j['collisionSuffix'] as bool? ?? true ? '_1' : ''),
+        collisionStyle: _validCollisionStyle(j['collisionSuffix']),
         prefix: j['prefix'] as String? ?? '',
         suffix: j['suffix'] as String? ?? '',
         forceOcr: j['forceOcr'] as bool? ?? false,
@@ -240,8 +248,8 @@ Future<Settings?> _migrateEguiSettings() async {
       default:
         s.timestampSource = 'earliest';
     }
-    // Flutter only supports on/off with "_1": any non-empty egui
-    // suffix ("_1", "-1", "(1)") maps to on; empty maps to off.
+    // Any egui suffix ("_1", "-1", "(1)") carries over; anything
+    // else (including empty, which used to mean "none") becomes _1.
     final coll = kv['photo_collision_suffix'];
     s.collisionStyle = coll != null && ['_1', '-1', '(1)'].contains(coll) ? coll : '_1';
     s.prefix = kv['photo_prefix'] ?? '';
@@ -1599,7 +1607,6 @@ class _HomePageState extends State<HomePage> {
               DropdownMenuItem(value: '_1', child: Text('_1')),
               DropdownMenuItem(value: '-1', child: Text('-1')),
               DropdownMenuItem(value: '(1)', child: Text('(1)')),
-              DropdownMenuItem(value: '', child: Text('None')),
             ],
             onChanged: (v) {
               if (v != null) setState(() => settings.collisionStyle = v);
@@ -1639,7 +1646,7 @@ class _HomePageState extends State<HomePage> {
           const Text(
               'Reset restores all settings above to their defaults and saves them.'),
           const Text(
-              'Note: Save settings (in Local AI above) also saves these. The collision suffix only affects date names — AI document names still use _1. "None" means no suffix when there is no collision; files that would collide still get _1, _2 so a rename can never overwrite another file.'),
+              'Note: Save settings (in Local AI above) also saves these. The collision suffix only affects date names — AI document names still use _1.'),
         ],
       ),
       const SizedBox(height: 16),
