@@ -58,7 +58,7 @@ import 'updater.dart';
 // so every install was offered its own version as an "update"
 // forever. The release checklist has five version locations;
 // this is one of them.
-const String appVersion = '1.4.6';
+const String appVersion = '1.4.7';
 
 class Settings {
   String ollamaUrl;
@@ -802,6 +802,21 @@ class _HomePageState extends State<HomePage> {
     setState(() => processing = true);
     try {
       final target = p.join(p.dirname(item.file.path), item.finalName);
+      // Never rename over an existing file: a rename must fail, not
+      // delete the file already at the target.
+      if (await File(target).exists() &&
+          p.normalize(target).toLowerCase() !=
+              p.normalize(item.file.path).toLowerCase()) {
+        item.status = 'Rename blocked: ${item.finalName} already exists.';
+        setState(() {
+          lastRenamed = 0;
+          lastFailed = 1;
+          renameDone = true;
+        });
+        _setLog('Rename blocked: ${item.finalName} already exists.');
+        setState(() => processing = false);
+        return;
+      }
       await item.file.rename(target);
       item.status = 'Renamed to ${item.finalName}';
       setState(() {
@@ -830,6 +845,17 @@ class _HomePageState extends State<HomePage> {
       processing = true;
       renameDone = false;
     });
+    // Last-resort guard (2026-11-12): a rename must never delete a
+    // file. Collision resolution is supposed to prevent identical
+    // final names, but in v1.4.5 two files sharing a timestamp got
+    // the same final name and the second rename overwrote the first.
+    // So check the actual targets before renaming anything: two items
+    // aiming at the same target are blocked, and a target that already
+    // exists on disk (even if another batch item is about to vacate
+    // it — loop order must not decide which file survives) is blocked.
+    // Blocked items are left alone with a clear status; the rest of
+    // the batch still renames.
+    final toRename = <FileItem>[];
     for (final item in items) {
       if (item.alreadyCorrect) {
         skipped++;
@@ -839,8 +865,42 @@ class _HomePageState extends State<HomePage> {
         skipped++;
         continue;
       }
+      toRename.add(item);
+    }
+    final targetOf = <FileItem, String>{};
+    final byTarget = <String, List<FileItem>>{};
+    for (final item in toRename) {
+      final target = p.join(p.dirname(item.file.path), item.finalName);
+      targetOf[item] = target;
+      byTarget.putIfAbsent(target.toLowerCase(), () => []).add(item);
+    }
+    final blocked = <FileItem>{};
+    for (final entry in byTarget.entries) {
+      if (entry.value.length > 1) {
+        for (final item in entry.value) {
+          item.status =
+              'Rename blocked: duplicate final name ${item.finalName} — fix the Final name and try again.';
+          blocked.add(item);
+        }
+      }
+    }
+    var blockedDuplicates = false;
+    for (final item in toRename) {
+      if (blocked.contains(item)) {
+        blockedDuplicates = true;
+        failed++;
+        continue;
+      }
+      final target = targetOf[item]!;
+      if (await File(target).exists() &&
+          p.normalize(target).toLowerCase() !=
+              p.normalize(item.file.path).toLowerCase()) {
+        item.status =
+            'Rename blocked: ${item.finalName} already exists — fix the Final name and try again.';
+        failed++;
+        continue;
+      }
       try {
-        final target = p.join(p.dirname(item.file.path), item.finalName);
         await item.file.rename(target);
         item.status = 'Renamed';
         renamed++;
@@ -855,7 +915,8 @@ class _HomePageState extends State<HomePage> {
       lastFailed = failed;
       renameDone = true;
     });
-    _setLog('Done: $renamed renamed • $failed failed. (Skipped: $skipped.)');
+    _setLog('Done: $renamed renamed • $failed failed. (Skipped: $skipped.)'
+        '${blockedDuplicates ? ' Duplicate final names were blocked, not overwritten.' : ''}');
   }
 
   Future<void> _checkUpdates() async {
@@ -1578,7 +1639,7 @@ class _HomePageState extends State<HomePage> {
           const Text(
               'Reset restores all settings above to their defaults and saves them.'),
           const Text(
-              'Note: Save settings (in Local AI above) also saves these. The collision suffix only affects date names — AI document names still use _1.'),
+              'Note: Save settings (in Local AI above) also saves these. The collision suffix only affects date names — AI document names still use _1. "None" means no suffix when there is no collision; files that would collide still get _1, _2 so a rename can never overwrite another file.'),
         ],
       ),
       const SizedBox(height: 16),

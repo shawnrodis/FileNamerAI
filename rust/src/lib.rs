@@ -1641,13 +1641,15 @@ fn resolve_batch_json(input: &str) -> serde_json::Value {
             } else {
                 let mut n = 1u32;
                 for &idx in &members {
+                    // A collision is being resolved here (two or more files
+                    // want the same stem, or the stem already exists on
+                    // disk), so a suffix is mandatory: without one, the
+                    // second rename would overwrite the first and delete
+                    // a file. "None" only means "no suffix when there is
+                    // no collision" — it must never produce two identical
+                    // final names, so fall back to _1 for this case.
                     let style = if rows[idx].date_source.is_some() { photo_style.as_str() } else { "_1" };
-                    if style.is_empty() {
-                        // Collision suffix disabled in the UI: keep the stem.
-                        taken.insert(full(&stem).to_lowercase());
-                        out[idx] = serde_json::json!({"final_name": full(&stem), "status": "ready", "suffixed": false});
-                        continue;
-                    }
+                    let style = if style.is_empty() { "_1" } else { style };
                     loop {
                         let cand = collision_name(&stem, n, style);
                         if n > 9999 { break; }
@@ -1860,5 +1862,115 @@ mod tests {
     fn numbers_and_apostrophes_survive_normalization() {
         assert_eq!(title_case_slug("form-1040"), "Form 1040");
         assert_eq!(title_case_slug("mother's-day-card"), "Mother's Day Card");
+    }
+
+    // Collision resolution (2026-11-12 regression): two files sharing a
+    // timestamp must never resolve to the same final name, or the second
+    // rename overwrites the first and deletes a file. That is what
+    // happened with two Messenger downloads proposing
+    // 11-12-26-12-19-00 in v1.4.5: both finals were plain
+    // 11-12-26-12-19-00.jpg and one file was lost.
+    fn resolve_finals(dir: &Path, style: &str, rows: Vec<serde_json::Value>) -> Vec<String> {
+        let input = serde_json::json!({
+            "photo_collision_suffix": style,
+            "rows": rows,
+        })
+        .to_string();
+        let out = resolve_batch_json(&input);
+        out["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["final_name"].as_str().unwrap_or("").to_string())
+            .collect()
+    }
+
+    fn date_row(dir: &Path, name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "path": dir.join(name).to_string_lossy(),
+            "current_name": name,
+            "ext": "jpg",
+            "proposed": "11-12-26-12-19-00",
+            "ready": true,
+            "error": false,
+            "date_source": "file created date",
+        })
+    }
+
+    fn fresh_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("fna-collision-{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn duplicate_stems_get_suffix_even_with_none_style() {
+        let dir = fresh_dir("none");
+        for name in ["Messenger_creation_8FB31831-5.jpg", "Messenger_creation_F50394A2-1.jpg"] {
+            std::fs::write(dir.join(name), b"fake").unwrap();
+        }
+        let finals = resolve_finals(
+            &dir,
+            "",
+            vec![
+                date_row(&dir, "Messenger_creation_8FB31831-5.jpg"),
+                date_row(&dir, "Messenger_creation_F50394A2-1.jpg"),
+            ],
+        );
+        assert_eq!(
+            finals,
+            vec!["11-12-26-12-19-00_1.jpg", "11-12-26-12-19-00_2.jpg"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn duplicate_stems_get_suffix_with_default_style() {
+        let dir = fresh_dir("default");
+        for name in ["Messenger_creation_8FB31831-5.jpg", "Messenger_creation_F50394A2-1.jpg"] {
+            std::fs::write(dir.join(name), b"fake").unwrap();
+        }
+        let finals = resolve_finals(
+            &dir,
+            "_1",
+            vec![
+                date_row(&dir, "Messenger_creation_8FB31831-5.jpg"),
+                date_row(&dir, "Messenger_creation_F50394A2-1.jpg"),
+            ],
+        );
+        assert_eq!(
+            finals,
+            vec!["11-12-26-12-19-00_1.jpg", "11-12-26-12-19-00_2.jpg"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn single_file_with_none_style_stays_plain() {
+        // "None" still means no suffix when there is no collision.
+        let dir = fresh_dir("single");
+        std::fs::write(dir.join("Messenger_creation_8FB31831-5.jpg"), b"fake").unwrap();
+        let finals = resolve_finals(
+            &dir,
+            "",
+            vec![date_row(&dir, "Messenger_creation_8FB31831-5.jpg")],
+        );
+        assert_eq!(finals, vec!["11-12-26-12-19-00.jpg"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn single_file_colliding_with_disk_file_gets_suffix_even_with_none_style() {
+        let dir = fresh_dir("disk");
+        std::fs::write(dir.join("11-12-26-12-19-00.jpg"), b"existing").unwrap();
+        std::fs::write(dir.join("Messenger_creation_8FB31831-5.jpg"), b"fake").unwrap();
+        let finals = resolve_finals(
+            &dir,
+            "",
+            vec![date_row(&dir, "Messenger_creation_8FB31831-5.jpg")],
+        );
+        assert_eq!(finals, vec!["11-12-26-12-19-00_1.jpg"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
