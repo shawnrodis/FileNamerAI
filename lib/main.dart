@@ -23,7 +23,8 @@
 //    titles are never invented.
 //  - Already-correctly-named files are left alone.
 //
-// KNOWN GAPS (honest, not faked): Mac DMG. Automatic update
+// NOTES (honest, not faked): Mac DMG ships since v1.4.5 (universal,
+// ad-hoc signed). Automatic update
 // install is implemented (verified download + delayed installer
 // launch, same pattern as Utility Closet). AI OCR for image-only PDFs works via the Rust core
 // (Ollama vision model), with a Force AI OCR toggle in Settings.
@@ -1667,7 +1668,7 @@ class _HomePageState extends State<HomePage> {
           '• The Advanced photo/video naming section above can change any of these defaults.'),
       const SizedBox(height: 16),
       const Text(
-        'Gaps: Mac build is NOT implemented yet. Automatic update install is implemented (verified download + delayed installer launch). AI OCR for image-only PDFs now works via the Rust core (Ollama vision model), and file Created time works via Rust. Settings are saved on disk and reloaded on launch.',
+        'Notes: Mac build ships as a universal DMG since v1.4.5. Automatic update install is implemented (verified download + delayed installer launch). AI OCR for image-only PDFs now works via the Rust core (Ollama vision model), and file Created time works via Rust. Settings are saved on disk and reloaded on launch.',
         style: TextStyle(color: Colors.grey),
       ),
       if (!_settingsLoaded) const Text('Loading saved settings…'),
